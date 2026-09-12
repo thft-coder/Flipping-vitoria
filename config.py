@@ -41,15 +41,15 @@ QUARTOS_MINIMO = 3
 # Exigir presença de elevador no edifício
 EXIGIR_ELEVADOR = True
 
-# Termos e comodidades usados para identificar elevador em descrições ou
-# atributos técnicos do anúncio
-TERMOS_ELEVADOR = [
-    "elevador",
-    "com elevador",
-    "edifício com elevador",
-]
+# Ausência explícita de elevador no título/descrição do anúncio
+REGEX_SEM_ELEVADOR = re.compile(
+    r'\b(sem|n[aã]o\s+possui|n[aã]o\s+tem|dispensa)\s+elevador\b', re.IGNORECASE
+)
 
-REGEX_ELEVADOR = re.compile(
-    "|".join(re.escape(termo) for termo in TERMOS_ELEVADOR),
+# Afirmação textual de presença de elevador no título/descrição do anúncio
+REGEX_COM_ELEVADOR = re.compile(
+    r'\b(com\s+elevador|possui\s+elevador|edif[íi]cio\s+com\s+elevador|'
+    r'pr[éè]dio\s+com\s+elevador|2\s+elevadores|dois\s+elevadores|'
+    r'elevador\s+social)\b',
     re.IGNORECASE,
 )

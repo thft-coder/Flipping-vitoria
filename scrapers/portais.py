@@ -29,7 +29,8 @@ from config import (
     JANELA_MAX_HORAS,
     PRECO_MAXIMO,
     QUARTOS_MINIMO,
-    REGEX_ELEVADOR,
+    REGEX_COM_ELEVADOR,
+    REGEX_SEM_ELEVADOR,
 )
 from database import ja_processado
 
@@ -42,20 +43,42 @@ HEADERS = {
     )
 }
 
-# Termos que indicam ausência explícita de elevador. Diferente de
-# config.REGEX_ELEVADOR (que identifica a presença), isto é um detalhe de
-# interpretação de texto usado apenas na extração, para que uma descrição
-# como "sem elevador" não seja tratada como comprovação de presença.
-TERMOS_SEM_ELEVADOR = [
-    "sem elevador",
-    "não possui elevador",
-    "não tem elevador",
-    "não há elevador",
-]
-REGEX_SEM_ELEVADOR = re.compile(
-    "|".join(re.escape(termo) for termo in TERMOS_SEM_ELEVADOR),
-    re.IGNORECASE,
-)
+# Regra 4 de validar_presenca_elevador: termo "elevador"/"elevadores" isolado,
+# sem estar em um contexto de negação (já tratado pela Regra 2).
+REGEX_ELEVADOR_ISOLADO = re.compile(r"\belevador(es)?\b", re.IGNORECASE)
+
+
+def validar_presenca_elevador(anuncio: dict) -> bool:
+    """Valida a presença de elevador a partir de atributos estruturados e do
+    texto (título + descrição) do anúncio, tratando corretamente contextos de
+    negação e afirmação. Espera um dict com as chaves opcionais
+    "atributos_estruturados" (list), "titulo" e "descricao".
+
+    Regras, em ordem de prioridade:
+    1. Atributo estruturado das amenities contendo 'elevador'/'ELEVATOR' -> True.
+    2. Negação explícita no texto (REGEX_SEM_ELEVADOR) -> False imediato.
+    3. Afirmação textual (REGEX_COM_ELEVADOR) -> True.
+    4. Termo isolado "elevador"/"elevadores", sem negação -> True.
+    5. Caso contrário -> False (descarte seguro).
+    """
+    atributos_estruturados = anuncio.get("atributos_estruturados") or []
+    texto = f"{anuncio.get('titulo', '')} {anuncio.get('descricao', '')}"
+
+    for atributo in atributos_estruturados:
+        valor = str(atributo).strip().lower()
+        if valor in ("elevador", "elevator") or "elevador" in valor:
+            return True
+
+    if REGEX_SEM_ELEVADOR.search(texto):
+        return False
+
+    if REGEX_COM_ELEVADOR.search(texto):
+        return True
+
+    if REGEX_ELEVADOR_ISOLADO.search(texto):
+        return True
+
+    return False
 
 
 class BaseScraper(ABC):
@@ -114,14 +137,12 @@ class BaseScraper(ABC):
 
         return validos
 
-    def _aplicar_criterios_obrigatorios(
-        self, item: dict, atributos_estruturados: list | None, texto_completo: str
-    ) -> bool:
+    def _aplicar_criterios_obrigatorios(self, item: dict) -> bool:
         """Filtro de descarte imediato: preço máximo, quartos mínimo e
-        comprovação estrita de elevador, aplicado antes de repassar o item
-        ao motor de análise. Retorna False (com log estruturado do motivo)
-        se qualquer critério obrigatório não for atendido ou não puder ser
-        comprovado a partir dos dados extraídos."""
+        comprovação estrita de elevador (validar_presenca_elevador), aplicado
+        antes de repassar o item ao motor de análise. Retorna False (com log
+        estruturado do motivo) se qualquer critério obrigatório não for
+        atendido ou não puder ser comprovado a partir dos dados extraídos."""
         id_origem = item.get("id_origem")
         preco = item.get("preco")
         quartos = item.get("quartos")
@@ -156,7 +177,7 @@ class BaseScraper(ABC):
             )
             return False
 
-        if EXIGIR_ELEVADOR and not self._possui_elevador(atributos_estruturados, texto_completo):
+        if EXIGIR_ELEVADOR and not validar_presenca_elevador(item):
             logger.info(
                 "descartado motivo=elevador_nao_comprovado portal=%s id_origem=%s",
                 self.portal, id_origem,
@@ -164,25 +185,6 @@ class BaseScraper(ABC):
             return False
 
         return True
-
-    @staticmethod
-    def _possui_elevador(atributos_estruturados: list | None, texto: str) -> bool:
-        """Comprova a presença de elevador de forma estrita: ausência
-        explícita no texto ("sem elevador") descarta imediatamente; na
-        falta de qualquer evidência positiva (atributo estruturado ou termo
-        no título/descrição), também descarta — a presença nunca é
-        presumida por omissão."""
-        texto = texto or ""
-
-        if REGEX_SEM_ELEVADOR.search(texto):
-            return False
-
-        for atributo in atributos_estruturados or []:
-            valor = str(atributo).strip().lower()
-            if valor in ("elevador", "elevator") or "elevador" in valor:
-                return True
-
-        return bool(REGEX_ELEVADOR.search(texto))
 
     @staticmethod
     def _parse_data_iso(valor) -> datetime | None:
@@ -305,14 +307,15 @@ class OLXScraper(BaseScraper):
             "bairro": bairro,
             "url": url,
             "descricao": descricao,
+            "atributos_estruturados": atributos_estruturados,
             "data_criacao_anuncio": data_publicacao.isoformat(),
             "data_criacao_anuncio_dt": data_publicacao,
         }
 
-        texto_completo = f"{titulo} {descricao}"
-        if not self._aplicar_criterios_obrigatorios(item, atributos_estruturados, texto_completo):
+        if not self._aplicar_criterios_obrigatorios(item):
             return None
 
+        item.pop("atributos_estruturados", None)
         return item
 
 
@@ -406,12 +409,13 @@ class ZapVivaRealScraper(BaseScraper):
             "bairro": bairro,
             "url": url,
             "descricao": descricao,
+            "atributos_estruturados": atributos_estruturados,
             "data_criacao_anuncio": data_publicacao.isoformat(),
             "data_criacao_anuncio_dt": data_publicacao,
         }
 
-        texto_completo = f"{titulo} {descricao}"
-        if not self._aplicar_criterios_obrigatorios(item, atributos_estruturados, texto_completo):
+        if not self._aplicar_criterios_obrigatorios(item):
             return None
 
+        item.pop("atributos_estruturados", None)
         return item
