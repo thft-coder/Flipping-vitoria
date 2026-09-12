@@ -346,7 +346,11 @@ class OLXScraper(BaseScraper):
                         user_agent=HEADERS_OLX["User-Agent"],
                         locale="pt-BR",
                     )
-                    pagina.goto(url_completa, wait_until="networkidle", timeout=30000)
+                    # "networkidle" expirava em 30s no runner do GitHub
+                    # Actions (conexões que nunca ficam ociosas — analytics,
+                    # websockets etc.); "domcontentloaded" só espera o HTML
+                    # inicial, suficiente para o __NEXT_DATA__ embutido.
+                    pagina.goto(url_completa, wait_until="domcontentloaded", timeout=30000)
                     html = pagina.content()
                 finally:
                     navegador.close()
