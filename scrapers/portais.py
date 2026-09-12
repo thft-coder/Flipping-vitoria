@@ -304,14 +304,26 @@ class BaseScraper(ABC):
         )
 
         hrefs = [a.get("href", "") for a in soup.find_all("a", href=True)]
+        # CONFIRMAR (bug corrigido): a versão anterior exigia >=2 barras no
+        # href, excluindo silenciosamente padrões de 1 segmento comuns em
+        # anúncios de classificados (ex.: "/titulo-do-anuncio-1234567890").
         prefixos = Counter(
-            href.split("?")[0].rsplit("/", 1)[0]
+            href.split("?")[0].rsplit("/", 1)[0] or "/"
             for href in hrefs
-            if href.startswith("/") and href.count("/") >= 2
+            if href.startswith("/")
         )
         logger.info(
             "diagnostico_prefixos_href portal=%s total_links=%d mais_comuns=%r",
             self.portal, len(hrefs), prefixos.most_common(15),
+        )
+
+        # Sinal mais direto que agregação de prefixo: amostra de hrefs que
+        # terminam em sequência longa de dígitos — assinatura comum de ID
+        # de anúncio em classificados, independente da estrutura de path.
+        links_com_id_numerico = [h for h in hrefs if re.search(r"-\d{6,}/?(?:\?.*)?$", h)]
+        logger.info(
+            "diagnostico_links_com_id_numerico portal=%s total=%d amostra=%r",
+            self.portal, len(links_com_id_numerico), links_com_id_numerico[:10],
         )
 
         texto_lower = html.lower()
