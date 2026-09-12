@@ -545,21 +545,22 @@ class BaseScraper(ABC):
 class OLXScraper(BaseScraper):
     """Extrator de anúncios de apartamentos e casas em Vitória-ES na OLX.
 
-    A ordenação por "mais recentes" e a extração via JSON embutido
-    (`__NEXT_DATA__`) seguem o padrão publicamente documentado de páginas
-    Next.js da OLX. O valor do parâmetro `sf`, os parâmetros de preço
-    máximo (`pe`) e quartos mínimo (`ros`), e o caminho `props.pageProps`
-    estão marcados como CONFIRMAR: não puderam ser validados neste ambiente
-    por bloqueio de egress a olx.com.br.
+    Os parâmetros `sf`/`pe`/`ros` (ordenação, preço máximo, quartos mínimo)
+    usados antes eram supostos, nunca confirmados, e o diagnóstico
+    estrutural (rodado em produção via GitHub Actions) mostrou evidência de
+    que causavam 0 resultados reais: dos 207 links da página buscada com
+    esses parâmetros, nenhum se agrupava em um padrão de anúncio — só
+    links de navegação/categoria, sugerindo busca vazia (mesmo padrão do
+    problema que já ocorreu com os parâmetros do glue-api do ZAP/VivaReal).
+    Por isso a busca aqui usa só a URL base, sem parâmetros de filtro/
+    ordenação — preço, quartos e demais critérios continuam sendo
+    aplicados do nosso lado em _aplicar_criterios_obrigatorios, como já é
+    feito para elevador e bairro.
     """
 
     portal = "olx"
     BASE_URL = "https://www.olx.com.br/imoveis/venda/estado-es/grande-vitoria/vitoria"
-    PARAMS = {
-        "sf": "1",  # CONFIRMAR: ordenação por "mais recentes"
-        "pe": "750000",  # CONFIRMAR: "preço até" (preço máximo)
-        "ros": "3",  # CONFIRMAR: quartos mínimo
-    }
+    PARAMS: dict = {}
     # Espera (fallback Playwright) por qualquer um destes indícios de
     # conteúdo real carregado — CONFIRMAR os seletores contra o site real.
     SELECTOR_ESPERA = 'script#__NEXT_DATA__, div[data-ds-component="DS-AdCard"], a[href*="/vi/"]'
