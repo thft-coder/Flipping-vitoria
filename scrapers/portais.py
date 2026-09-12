@@ -206,20 +206,29 @@ class BaseScraper(ABC):
 
     def _finalizar_item(self, item: dict) -> dict | None:
         """Aplica os critérios obrigatórios e, se aprovado, finaliza o item:
-        remove o campo transiente "atributos_estruturados" e marca
-        "elevador": True (passar pelos critérios já comprova a presença).
-        Retorna None se o item for reprovado."""
+        remove o campo transiente "atributos_estruturados" e calcula
+        "elevador" com validar_presenca_elevador. Com EXIGIR_ELEVADOR=False
+        (critério não é mais eliminatório), o item pode passar mesmo com
+        elevador=False — o valor reflete o que foi realmente comprovado no
+        texto/atributos, nunca é fixado como True por suposição. Retorna
+        None se o item for reprovado em algum critério ainda eliminatório."""
         if not self._aplicar_criterios_obrigatorios(item):
             return None
 
+        elevador_confirmado = validar_presenca_elevador(item)
         item.pop("atributos_estruturados", None)
-        item["elevador"] = True
+        item["elevador"] = elevador_confirmado
         return item
 
-    def _buscar_html_com_fallback_playwright(self, url: str, params: dict) -> str | None:
+    def _buscar_html_com_fallback_playwright(
+        self, url: str, params: dict, selector_espera: str | None = None
+    ) -> str | None:
         """Busca uma página via requests com headers de navegador; em caso
         de bloqueio HTTP 403 (anti-bot), recorre ao Playwright headless
-        para renderizar a página com um navegador real."""
+        para renderizar a página com um navegador real. `selector_espera`
+        (opcional) é um seletor CSS aguardado explicitamente após o
+        carregamento, para dar tempo à hidratação de conteúdo React antes
+        de capturar o HTML final (ver `_buscar_html_via_playwright`)."""
         try:
             resposta = requests.get(url, params=params, headers=HEADERS_NAVEGADOR, timeout=15)
         except requests.RequestException as exc:
@@ -233,7 +242,7 @@ class BaseScraper(ABC):
                 self.portal,
             )
             url_completa = f"{url}?{urlencode(params)}" if params else url
-            return self._buscar_html_via_playwright(url_completa)
+            return self._buscar_html_via_playwright(url_completa, selector_espera)
 
         try:
             resposta.raise_for_status()
@@ -243,10 +252,39 @@ class BaseScraper(ABC):
 
         return resposta.text
 
-    def _buscar_html_via_playwright(self, url: str) -> str | None:
+    # Marcadores textuais de uma página de desafio do Cloudflare (Turnstile/
+    # "Just a moment..."), usados apenas para diagnóstico em log — CONFIRMAR
+    # contra o HTML real, pois a redação exata pode variar.
+    _MARCADORES_BLOQUEIO_CLOUDFLARE = [
+        "just a moment",
+        "attention required",
+        "checking your browser",
+        "cf-challenge",
+        "cf_chl_opt",
+        "turnstile",
+    ]
+
+    @classmethod
+    def _diagnosticar_bloqueio(cls, html: str) -> str | None:
+        """Verifica se o HTML recebido contém marcadores conhecidos de
+        página de desafio do Cloudflare. Retorna o marcador encontrado, ou
+        None se nenhum bater (o que não garante ausência de bloqueio — pode
+        ser um mecanismo diferente, por isso o HTML também é logado)."""
+        texto = (html or "").lower()
+        for marcador in cls._MARCADORES_BLOQUEIO_CLOUDFLARE:
+            if marcador in texto:
+                return marcador
+        return None
+
+    def _buscar_html_via_playwright(self, url: str, selector_espera: str | None = None) -> str | None:
         """Renderiza a página com Chromium headless (Playwright) para
         contornar bloqueios 403 baseados em verificação de navegador real
-        (JS/TLS/fingerprint), que simples ajuste de headers não resolve."""
+        (JS/TLS/fingerprint), que simples ajuste de headers não resolve.
+        Aplica evasões de fingerprint (playwright-stealth) e simula um
+        contexto de navegador real (viewport, locale e fuso horário de
+        Vitória-ES) — mitiga detecção por automação, mas não contorna um
+        bloqueio por reputação de IP/ASN (datacenter do GitHub Actions),
+        que exigiria um proxy residencial, fora do escopo desta mudança."""
         try:
             from playwright.sync_api import sync_playwright
         except ImportError:
@@ -258,22 +296,75 @@ class BaseScraper(ABC):
             return None
 
         try:
+            from playwright_stealth import Stealth
+            stealth = Stealth(navigator_languages_override=("pt-BR", "pt"))
+        except ImportError:
+            logger.warning(
+                "playwright_stealth_indisponivel portal=%s "
+                "motivo=biblioteca_nao_instalada_seguindo_sem_evasao",
+                self.portal,
+            )
+            stealth = None
+
+        try:
             with sync_playwright() as playwright:
-                navegador = playwright.chromium.launch(headless=True)
+                navegador = playwright.chromium.launch(
+                    headless=True,
+                    args=[
+                        "--disable-blink-features=AutomationControlled",
+                        "--no-sandbox",
+                        "--disable-infobars",
+                    ],
+                )
                 try:
-                    pagina = navegador.new_page(
+                    contexto = navegador.new_context(
                         user_agent=HEADERS_NAVEGADOR["User-Agent"],
+                        viewport={"width": 1366, "height": 768},
                         locale="pt-BR",
+                        timezone_id="America/Sao_Paulo",
                     )
+                    pagina = contexto.new_page()
+                    if stealth is not None:
+                        stealth.apply_stealth_sync(pagina)
+
                     # "networkidle" chegou a expirar em 30s em teste real no
                     # runner do GitHub Actions (conexões que nunca ficam
                     # ociosas — analytics, websockets etc.); "domcontentloaded"
-                    # só espera o HTML inicial, suficiente para o conteúdo
-                    # embutido/renderizado no primeiro paint.
-                    pagina.goto(url, wait_until="domcontentloaded", timeout=30000)
+                    # só espera o HTML inicial.
+                    pagina.goto(url, wait_until="domcontentloaded", timeout=45000)
+                    pagina.wait_for_timeout(3000)  # aguarda hidratação do React
+
+                    seletor_encontrado = True
+                    if selector_espera:
+                        try:
+                            # state="attached": basta existir no DOM. O
+                            # padrão ("visible") nunca seria satisfeito por
+                            # um <script>, que não é visualmente renderizado
+                            # mesmo estando presente — testado localmente.
+                            pagina.wait_for_selector(
+                                selector_espera, state="attached", timeout=15000
+                            )
+                        except Exception:
+                            seletor_encontrado = False
+
                     html = pagina.content()
                 finally:
                     navegador.close()
+
+            marcador_bloqueio = self._diagnosticar_bloqueio(html)
+            if marcador_bloqueio:
+                logger.error(
+                    "bloqueio_cloudflare_detectado portal=%s marcador=%r "
+                    "html_tamanho=%d html_inicio=%r",
+                    self.portal, marcador_bloqueio, len(html), html[:500],
+                )
+            elif selector_espera and not seletor_encontrado:
+                logger.warning(
+                    "seletor_nao_encontrado_apos_espera portal=%s seletor=%r "
+                    "html_tamanho=%d html_inicio=%r",
+                    self.portal, selector_espera, len(html), html[:500],
+                )
+
             return html
         except Exception as exc:
             # Captura ampla proposital: falhas de infraestrutura do navegador
@@ -419,9 +510,14 @@ class OLXScraper(BaseScraper):
         "pe": "750000",  # CONFIRMAR: "preço até" (preço máximo)
         "ros": "3",  # CONFIRMAR: quartos mínimo
     }
+    # Espera (fallback Playwright) por qualquer um destes indícios de
+    # conteúdo real carregado — CONFIRMAR os seletores contra o site real.
+    SELECTOR_ESPERA = 'script#__NEXT_DATA__, div[data-ds-component="DS-AdCard"], a[href*="/vi/"]'
 
     def extrair_recentes(self) -> list[dict]:
-        html = self._buscar_html_com_fallback_playwright(self.BASE_URL, self.PARAMS)
+        html = self._buscar_html_com_fallback_playwright(
+            self.BASE_URL, self.PARAMS, self.SELECTOR_ESPERA
+        )
         if html is None:
             return []
 

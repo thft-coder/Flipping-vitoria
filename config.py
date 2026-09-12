@@ -43,8 +43,13 @@ PRECO_MAXIMO = 750000.0
 # Quantidade mínima de quartos exigida
 QUARTOS_MINIMO = 3
 
-# Exigir presença de elevador no edifício
-EXIGIR_ELEVADOR = True
+# Exigir presença de elevador no edifício como critério eliminatório.
+# Desativado: cards de busca (OLX/VivaReal) raramente mencionam "elevador"
+# no texto visível resumido (a comodidade costuma aparecer só como ícone ou
+# na descrição completa do anúncio, não indexada pelo scraper), então esse
+# critério gerava falsos negativos descartando imóveis dentro dos demais
+# critérios. A presença ainda é calculada e exibida (não é mais eliminatória).
+EXIGIR_ELEVADOR = False
 
 # Ausência explícita de elevador no título/descrição do anúncio
 REGEX_SEM_ELEVADOR = re.compile(

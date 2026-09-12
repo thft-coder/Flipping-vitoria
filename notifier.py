@@ -34,13 +34,16 @@ def _formatar_mensagem(imovel: dict) -> str:
     desconto_fmt = f"{desconto_percentual:.2f}%" if desconto_percentual is not None else "N/D"
     gatilho_aprovacao = imovel.get("gatilho_aprovacao", "N/D")
     url = imovel.get("url", "N/D")
+    # Elevador não é mais critério eliminatório (config.EXIGIR_ELEVADOR):
+    # reflete o que foi de fato comprovado no anúncio, sem presumir.
+    elevador_status = "Confirmada" if imovel.get("elevador") else "Não confirmada no anúncio"
 
     return (
         "*Oportunidade de Flipping Identificada*\n\n"
         f"*Bairro:* {bairro}\n"
         f"*Preço:* {preco_fmt}\n"
         f"*Quartos:* {quartos} (mínimo 3)\n"
-        f"*Elevador:* Presença confirmada\n"
+        f"*Elevador:* {elevador_status}\n"
         f"*Preço/m²:* {preco_m2_fmt}\n"
         f"*Desconto vs. Mediana:* {desconto_fmt} (mediana do bairro: {mediana_fmt}/m²)\n"
         f"*Gatilho de disparo:* {gatilho_aprovacao}\n"

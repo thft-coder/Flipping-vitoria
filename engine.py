@@ -19,11 +19,14 @@ logger = logging.getLogger(__name__)
 def avaliar_oportunidade(dados_imovel: dict) -> dict | None:
     """Aplica os filtros eliminatórios obrigatórios e a regra de aprovação
     de flipping sobre um imóvel já extraído (dict com, no mínimo, preco,
-    quartos, elevador, area_m2 e bairro).
+    quartos, area_m2 e bairro).
 
     Filtros eliminatórios: preço acima de PRECO_MAXIMO, quartos abaixo de
-    QUARTOS_MINIMO, elevador não confirmado, área privativa inválida (<= 0)
-    ou bairro fora de config.BENCHMARKS_M2.
+    QUARTOS_MINIMO, área privativa inválida (<= 0) ou bairro fora de
+    config.BENCHMARKS_M2. A presença de elevador (campo "elevador") não é
+    mais eliminatória — cards de busca raramente mencionam essa comodidade
+    no texto resumido — mas o valor é repassado no resultado para exibição
+    no alerta.
 
     Regra de aprovação: desconto do preço/m² em relação à mediana do
     bairro >= THRESHOLD_DESCONTO_MINIMO (25%), OU desconto >=
@@ -35,7 +38,6 @@ def avaliar_oportunidade(dados_imovel: dict) -> dict | None:
     id_origem = dados_imovel.get("id_origem")
     preco = dados_imovel.get("preco")
     quartos = dados_imovel.get("quartos")
-    elevador = dados_imovel.get("elevador")
     area_m2 = dados_imovel.get("area_m2")
     bairro = dados_imovel.get("bairro")
 
@@ -50,13 +52,6 @@ def avaliar_oportunidade(dados_imovel: dict) -> dict | None:
         logger.info(
             "reprovado motivo=quartos_insuficiente id_origem=%s quartos=%s minimo=%s",
             id_origem, quartos, QUARTOS_MINIMO,
-        )
-        return None
-
-    if elevador is not True:
-        logger.info(
-            "reprovado motivo=elevador_nao_confirmado id_origem=%s elevador=%s",
-            id_origem, elevador,
         )
         return None
 
