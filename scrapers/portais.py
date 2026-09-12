@@ -22,6 +22,8 @@ import hashlib
 import json
 import logging
 import re
+import time
+import urllib.parse
 from abc import ABC, abstractmethod
 from collections import Counter
 from datetime import datetime, timedelta, timezone
@@ -639,22 +641,35 @@ class BaseScraper(ABC):
 class OLXScraper(BaseScraper):
     """Extrator de anúncios de apartamentos e casas em Vitória-ES na OLX.
 
-    Os parâmetros `sf`/`pe`/`ros` (ordenação, preço máximo, quartos mínimo)
-    usados antes eram supostos, nunca confirmados, e o diagnóstico
-    estrutural (rodado em produção via GitHub Actions) mostrou evidência de
-    que causavam 0 resultados reais: dos 207 links da página buscada com
-    esses parâmetros, nenhum se agrupava em um padrão de anúncio — só
-    links de navegação/categoria, sugerindo busca vazia (mesmo padrão do
-    problema que já ocorreu com os parâmetros do glue-api do ZAP/VivaReal).
-    Por isso a busca aqui usa só a URL base, sem parâmetros de filtro/
-    ordenação — preço, quartos e demais critérios continuam sendo
-    aplicados do nosso lado em _aplicar_criterios_obrigatorios, como já é
-    feito para elevador e bairro.
+    Refatorado para busca textual direcionada por bairro (em vez de uma
+    varredura genérica da região metropolitana inteira, paginada). Causa
+    raiz do problema anterior, relatada pelo usuário e confirmada nos
+    logs reais: a busca genérica retorna anúncios da região metropolitana
+    inteira (Vila Velha, Serra, Cariacica, Anchieta), então os anúncios
+    de um bairro específico (ex.: Jardim Camburi) podem estar muito além
+    da página 3 e nunca são alcançados só com mais paginação genérica.
+    Usar o parâmetro de busca textual "q=<bairro>" busca restringir a
+    página inteira a resultados relevantes daquele bairro, tornando a
+    paginação (2 páginas por bairro) suficiente para cobrir os anúncios
+    reais, do mesmo jeito que uma busca manual pelo nome do bairro no
+    site faria.
+
+    CONFIRMAR (ainda não validado contra uma resposta real): o próprio
+    parâmetro "q" como busca textual funcional, e a combinação dele com
+    `sf`/`pe`/`ros` (ordenação/preço máximo/quartos mínimo). Nota
+    importante: esses 3 últimos parâmetros já foram testados antes, SEM
+    "q", e zeraram os resultados reais (evidência: dos 207 links
+    retornados, nenhum batia no padrão de anúncio) — não há garantia de
+    que a combinação com "q" mude esse comportamento. Se a próxima
+    execução real também zerar, a costura mais provável é remover
+    sf/pe/ros e manter só "q=<bairro>". Preço, quartos e demais critérios
+    continuam sendo aplicados do nosso lado em
+    _aplicar_criterios_obrigatorios independentemente do que o servidor
+    filtrar ou não.
     """
 
     portal = "olx"
     BASE_URL = "https://www.olx.com.br/imoveis/venda/estado-es/grande-vitoria/vitoria"
-    PARAMS: dict = {}
     # Espera (fallback Playwright) por qualquer um destes indícios de
     # conteúdo carregado. "a[href*=/imoveis/]" é confirmado via diagnóstico
     # real (links de anúncio contêm esse trecho), mas CSS não expressa a
@@ -662,54 +677,62 @@ class OLXScraper(BaseScraper):
     # esse seletor pode bater em links de navegação/categoria também.
     SELECTOR_ESPERA = 'script#__NEXT_DATA__, div[data-ds-component="DS-AdCard"], a[href*="/imoveis/"]'
 
-    # A URL de busca agrega toda a região metropolitana (evidência real:
-    # anúncios de Vila Velha, Serra, Cariacica e Anchieta aparecem, não só
-    # de Vitória) — não há confirmação de um parâmetro de filtro por
-    # município/bairro para restringir isso no lado do servidor. Em vez de
-    # arriscar outro parâmetro não confirmado, aumenta-se o volume de cards
-    # inspecionados varrendo mais páginas (parâmetro de paginação "o",
-    # convenção conhecida da OLX Brasil), e o filtro estrito dos 5 bairros
-    # monitorados (_extrair_bairro) já faz o resto do trabalho.
-    PAGINAS_MAX = 3
+    # Bairros-alvo monitorados (mesma lista de config.BENCHMARKS_M2), um
+    # por busca textual direcionada.
+    BAIRROS_ALVO = list(BENCHMARKS_M2.keys())
+
+    # Páginas varridas por bairro.
+    PAGINAS_POR_BAIRRO = 2
+
+    # Atraso entre trocas de bairro, para reduzir o risco de rate limit
+    # por repetição de requisições automatizadas em sequência rápida.
+    DELAY_ENTRE_BAIRROS_SEGUNDOS = 2
 
     def extrair_recentes(self) -> list[dict]:
         candidatos_totais: list[dict] = []
 
-        for pagina in range(1, self.PAGINAS_MAX + 1):
-            params = dict(self.PARAMS)
-            if pagina > 1:
-                params["o"] = str(pagina)  # CONFIRMAR: nome do parâmetro de paginação
+        for indice, bairro in enumerate(self.BAIRROS_ALVO):
+            bairro_url = urllib.parse.quote(bairro)
 
-            html = self._buscar_html_com_fallback_playwright(
-                self.BASE_URL, params, self.SELECTOR_ESPERA
-            )
-            if html is None:
-                logger.warning(
-                    "pagina_sem_html portal=%s pagina=%d", self.portal, pagina
+            for pagina in range(1, self.PAGINAS_POR_BAIRRO + 1):
+                url = f"{self.BASE_URL}?q={bairro_url}&sf=1&pe=750000&ros=3"
+                if pagina > 1:
+                    url += f"&o={pagina}"
+
+                html = self._buscar_html_com_fallback_playwright(
+                    url, {}, self.SELECTOR_ESPERA
                 )
-                continue
+                if html is None:
+                    logger.warning(
+                        "pagina_sem_html portal=%s bairro=%s pagina=%d",
+                        self.portal, bairro, pagina,
+                    )
+                    continue
 
-            dados_json = self._extrair_json_embutido(html)
-            if dados_json is not None:
-                anuncios = self._localizar_lista_anuncios(dados_json)
-                candidatos = [
-                    item
-                    for anuncio in anuncios
-                    if (item := self._normalizar_anuncio(anuncio)) is not None
-                ]
-            else:
-                logger.warning(
-                    "json_embutido_nao_encontrado portal=%s pagina=%d "
-                    "tentando_fallback=extracao_de_cards_html",
-                    self.portal, pagina,
+                dados_json = self._extrair_json_embutido(html)
+                if dados_json is not None:
+                    anuncios = self._localizar_lista_anuncios(dados_json)
+                    candidatos = [
+                        item
+                        for anuncio in anuncios
+                        if (item := self._normalizar_anuncio(anuncio)) is not None
+                    ]
+                else:
+                    logger.warning(
+                        "json_embutido_nao_encontrado portal=%s bairro=%s pagina=%d "
+                        "tentando_fallback=extracao_de_cards_html",
+                        self.portal, bairro, pagina,
+                    )
+                    candidatos = self._extrair_cards_html(html)
+
+                logger.info(
+                    "pagina_processada portal=%s bairro=%s pagina=%d candidatos=%d",
+                    self.portal, bairro, pagina, len(candidatos),
                 )
-                candidatos = self._extrair_cards_html(html)
+                candidatos_totais.extend(candidatos)
 
-            logger.info(
-                "pagina_processada portal=%s pagina=%d candidatos=%d",
-                self.portal, pagina, len(candidatos),
-            )
-            candidatos_totais.extend(candidatos)
+            if indice < len(self.BAIRROS_ALVO) - 1:
+                time.sleep(self.DELAY_ENTRE_BAIRROS_SEGUNDOS)
 
         return self._filtrar_e_logar(candidatos_totais)
 
