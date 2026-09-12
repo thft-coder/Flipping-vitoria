@@ -4,3 +4,4 @@ playwright
 playwright-stealth
 pydantic
 python-dotenv
+ddgs
