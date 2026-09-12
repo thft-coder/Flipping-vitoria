@@ -6,11 +6,14 @@ olx.com.br e vivareal.com.br/zapimoveis.com.br (bloqueado pelo proxy de
 rede), portanto os seletores, caminhos de JSON e parâmetros de consulta
 abaixo NÃO puderam ser validados contra uma requisição real. Eles seguem
 padrões estruturais publicamente documentados para esses portais (JSON
-embutido em página Next.js para a OLX; endpoint público de busca
-"glue-api" para o Grupo ZAP/VivaReal), mas cada trecho marcado com
-"CONFIRMAR" precisa ser verificado manualmente (ex.: via aba de rede do
-navegador) antes de uso em produção, já que ambos os portais alteram sua
-estrutura e mecanismos anti-bot com frequência.
+embutido em página Next.js para a OLX; página pública de busca com cards
+HTML para o Grupo ZAP/VivaReal), mas cada trecho marcado com "CONFIRMAR"
+precisa ser verificado manualmente (ex.: via aba de rede do navegador)
+antes de uso em produção, já que ambos os portais alteram sua estrutura e
+mecanismos anti-bot com frequência. O endpoint interno glue-api do
+ZAP/VivaReal, usado anteriormente, foi abandonado após retornar HTTP 400
+persistente mesmo com headers corretos — indício de parâmetro de consulta
+inválido/desatualizado do lado do servidor.
 """
 
 from __future__ import annotations
@@ -39,9 +42,10 @@ from database import ja_processado
 
 logger = logging.getLogger(__name__)
 
-# Headers para simular um navegador completo (a OLX passou a bloquear com
-# 403 requisições identificadas como automatizadas apenas pelo User-Agent).
-HEADERS_OLX = {
+# Headers para simular um navegador completo. Tanto OLX quanto VivaReal
+# passaram a bloquear (403) requisições identificadas como automatizadas
+# apenas pelo User-Agent padrão do requests/Playwright.
+HEADERS_NAVEGADOR = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
@@ -55,18 +59,6 @@ HEADERS_OLX = {
     "Sec-Fetch-Dest": "document",
     "Sec-Fetch-Mode": "navigate",
     "Sec-Fetch-Site": "none",
-}
-
-# Headers exigidos pelo endpoint público de busca do Grupo ZAP/VivaReal.
-# NOTA: um HTTP 400 (diferente do 403 da OLX) tipicamente indica parâmetro
-# de requisição inválido/malformado, não bloqueio por ausência de headers.
-# Adicionar estes headers é necessário mas pode não ser suficiente — os
-# parâmetros em ZapVivaRealScraper.PARAMS marcados como CONFIRMAR são a
-# causa mais provável de um 400 e devem ser revistos se o erro persistir.
-HEADERS_ZAP = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    "x-domain": "www.vivareal.com.br",
-    "Accept": "application/json",
 }
 
 # Regra 4 de validar_presenca_elevador: termo "elevador"/"elevadores" isolado,
@@ -224,6 +216,144 @@ class BaseScraper(ABC):
         item["elevador"] = True
         return item
 
+    def _buscar_html_com_fallback_playwright(self, url: str, params: dict) -> str | None:
+        """Busca uma página via requests com headers de navegador; em caso
+        de bloqueio HTTP 403 (anti-bot), recorre ao Playwright headless
+        para renderizar a página com um navegador real."""
+        try:
+            resposta = requests.get(url, params=params, headers=HEADERS_NAVEGADOR, timeout=15)
+        except requests.RequestException as exc:
+            logger.error("falha_requisicao portal=%s erro=%s", self.portal, exc)
+            return None
+
+        if resposta.status_code == 403:
+            logger.warning(
+                "bloqueio_403 portal=%s motivo=provavel_anti_bot "
+                "tentando_fallback=playwright",
+                self.portal,
+            )
+            url_completa = f"{url}?{urlencode(params)}" if params else url
+            return self._buscar_html_via_playwright(url_completa)
+
+        try:
+            resposta.raise_for_status()
+        except requests.RequestException as exc:
+            logger.error("falha_requisicao portal=%s erro=%s", self.portal, exc)
+            return None
+
+        return resposta.text
+
+    def _buscar_html_via_playwright(self, url: str) -> str | None:
+        """Renderiza a página com Chromium headless (Playwright) para
+        contornar bloqueios 403 baseados em verificação de navegador real
+        (JS/TLS/fingerprint), que simples ajuste de headers não resolve."""
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            logger.error(
+                "playwright_indisponivel portal=%s "
+                "motivo=biblioteca_nao_instalada_ou_browsers_ausentes",
+                self.portal,
+            )
+            return None
+
+        try:
+            with sync_playwright() as playwright:
+                navegador = playwright.chromium.launch(headless=True)
+                try:
+                    pagina = navegador.new_page(
+                        user_agent=HEADERS_NAVEGADOR["User-Agent"],
+                        locale="pt-BR",
+                    )
+                    # "networkidle" chegou a expirar em 30s em teste real no
+                    # runner do GitHub Actions (conexões que nunca ficam
+                    # ociosas — analytics, websockets etc.); "domcontentloaded"
+                    # só espera o HTML inicial, suficiente para o conteúdo
+                    # embutido/renderizado no primeiro paint.
+                    pagina.goto(url, wait_until="domcontentloaded", timeout=30000)
+                    html = pagina.content()
+                finally:
+                    navegador.close()
+            return html
+        except Exception as exc:
+            # Captura ampla proposital: falhas de infraestrutura do navegador
+            # (timeout de navegação, browser não instalado, crash) não devem
+            # interromper a execução dos demais scrapers.
+            logger.error("falha_playwright portal=%s erro=%s", self.portal, exc)
+            return None
+
+    def _card_generico_para_item(self, href: str, texto_card: str, url_absoluta: str, id_origem: str) -> dict | None:
+        """Constrói um item a partir do texto visível de um card de listagem
+        (usado pelos fallbacks HTML da OLX e do ZAP/VivaReal). Extrai preço,
+        área, quartos e bairro via regex/casamento de texto, e a data de
+        publicação a partir de badges de tempo relativo. Retorna None se não
+        houver indício de data (não se arrisca a comprovar a janela temporal
+        por omissão) — CONFIRMAR os formatos exatos contra o site real."""
+        data_publicacao = self._parse_data_relativa(texto_card)
+        if data_publicacao is None:
+            logger.info(
+                "descartado motivo=sem_indicio_de_data_no_card portal=%s url=%s",
+                self.portal, href,
+            )
+            return None
+
+        preco_match = re.search(r"R\$\s*([\d.,]+)", texto_card)
+        preco = (
+            self._to_float_or_none(preco_match.group(1).replace(".", "").replace(",", "."))
+            if preco_match else None
+        )
+
+        area_match = re.search(r"(\d+)\s*m²", texto_card)
+        area_m2 = self._to_float_or_none(area_match.group(1)) if area_match else 0.0
+
+        quartos_match = re.search(r"(\d+)\s*quartos?\b", texto_card, re.IGNORECASE)
+        quartos = self._to_int_or_none(quartos_match.group(1)) if quartos_match else None
+
+        bairro = next((b for b in BENCHMARKS_M2 if b.lower() in texto_card.lower()), "")
+
+        preco_m2 = round(preco / area_m2, 2) if preco and area_m2 else None
+
+        return {
+            "id_origem": id_origem,
+            "portal": self.portal,
+            "titulo": texto_card[:200],
+            "preco": preco,
+            "area_m2": area_m2,
+            "preco_m2": preco_m2,
+            "quartos": quartos,
+            "bairro": bairro,
+            "url": url_absoluta,
+            "descricao": texto_card,
+            "atributos_estruturados": [],
+            "data_criacao_anuncio": data_publicacao.isoformat(),
+            "data_criacao_anuncio_dt": data_publicacao,
+        }
+
+    _REGEX_HOJE = re.compile(r"\bhoje\b", re.IGNORECASE)
+    _REGEX_ONTEM = re.compile(r"\bontem\b", re.IGNORECASE)
+    _REGEX_HA_HORAS = re.compile(r"h[aá]\s*(\d+)\s*h(?:oras?)?\b", re.IGNORECASE)
+    _REGEX_HA_DIAS = re.compile(r"h[aá]\s*(\d+)\s*dias?\b", re.IGNORECASE)
+
+    @classmethod
+    def _parse_data_relativa(cls, texto: str) -> datetime | None:
+        # CONFIRMAR: formato exato dos badges de tempo relativo de cada portal.
+        agora = datetime.now(timezone.utc)
+
+        if cls._REGEX_HOJE.search(texto):
+            return agora
+        if cls._REGEX_ONTEM.search(texto):
+            return agora - timedelta(days=1)
+
+        match = cls._REGEX_HA_HORAS.search(texto)
+        if match:
+            return agora - timedelta(hours=int(match.group(1)))
+
+        match = cls._REGEX_HA_DIAS.search(texto)
+        if match:
+            return agora - timedelta(days=int(match.group(1)))
+
+        return None
+
     @staticmethod
     def _parse_data_iso(valor) -> datetime | None:
         if not valor:
@@ -272,7 +402,7 @@ class OLXScraper(BaseScraper):
     }
 
     def extrair_recentes(self) -> list[dict]:
-        html = self._buscar_html()
+        html = self._buscar_html_com_fallback_playwright(self.BASE_URL, self.PARAMS)
         if html is None:
             return []
 
@@ -293,74 +423,6 @@ class OLXScraper(BaseScraper):
             candidatos = self._extrair_cards_html(html)
 
         return self._filtrar_e_logar(candidatos)
-
-    def _buscar_html(self) -> str | None:
-        """Busca a página de busca da OLX via requests; em caso de bloqueio
-        HTTP 403 (anti-bot), recorre ao Playwright headless para renderizar
-        a página com um navegador real."""
-        try:
-            resposta = requests.get(
-                self.BASE_URL, params=self.PARAMS, headers=HEADERS_OLX, timeout=15
-            )
-        except requests.RequestException as exc:
-            logger.error("falha_requisicao portal=%s erro=%s", self.portal, exc)
-            return None
-
-        if resposta.status_code == 403:
-            logger.warning(
-                "bloqueio_403 portal=%s motivo=provavel_anti_bot "
-                "tentando_fallback=playwright",
-                self.portal,
-            )
-            return self._buscar_html_via_playwright()
-
-        try:
-            resposta.raise_for_status()
-        except requests.RequestException as exc:
-            logger.error("falha_requisicao portal=%s erro=%s", self.portal, exc)
-            return None
-
-        return resposta.text
-
-    def _buscar_html_via_playwright(self) -> str | None:
-        """Renderiza a página com Chromium headless (Playwright) para
-        contornar bloqueios 403 baseados em verificação de navegador real
-        (JS/TLS/fingerprint), que simples ajuste de headers não resolve."""
-        try:
-            from playwright.sync_api import sync_playwright
-        except ImportError:
-            logger.error(
-                "playwright_indisponivel portal=%s "
-                "motivo=biblioteca_nao_instalada_ou_browsers_ausentes",
-                self.portal,
-            )
-            return None
-
-        url_completa = f"{self.BASE_URL}?{urlencode(self.PARAMS)}"
-
-        try:
-            with sync_playwright() as playwright:
-                navegador = playwright.chromium.launch(headless=True)
-                try:
-                    pagina = navegador.new_page(
-                        user_agent=HEADERS_OLX["User-Agent"],
-                        locale="pt-BR",
-                    )
-                    # "networkidle" expirava em 30s no runner do GitHub
-                    # Actions (conexões que nunca ficam ociosas — analytics,
-                    # websockets etc.); "domcontentloaded" só espera o HTML
-                    # inicial, suficiente para o __NEXT_DATA__ embutido.
-                    pagina.goto(url_completa, wait_until="domcontentloaded", timeout=30000)
-                    html = pagina.content()
-                finally:
-                    navegador.close()
-            return html
-        except Exception as exc:
-            # Captura ampla proposital: falhas de infraestrutura do navegador
-            # (timeout de navegação, browser não instalado, crash) não devem
-            # interromper a execução dos demais scrapers.
-            logger.error("falha_playwright portal=%s erro=%s", self.portal, exc)
-            return None
 
     @staticmethod
     def _extrair_json_embutido(html: str) -> dict | None:
@@ -422,20 +484,10 @@ class OLXScraper(BaseScraper):
 
     def _extrair_cards_html(self, html: str) -> list[dict]:
         """Fallback de última instância quando o JSON embutido não é
-        encontrado (ex.: estrutura da página mudou). Extrai anúncios
-        diretamente dos cards em HTML, usando heurísticas que não dependem
-        de nomes de classe CSS específicos (não puderam ser validados
-        contra o site real neste ambiente):
-        - Identifica cards por links de detalhe do anúncio (padrão
-          conhecido publicamente: URLs de anúncio da OLX contêm "/vi/").
-        - Interpreta badges de tempo relativo comuns em classificados
-          brasileiros ("Hoje", "Ontem", "há Xh", "há X dias") como a data
-          de publicação — CONFIRMAR o texto exato usado pela OLX.
-        - Casa o texto do card contra os nomes de bairro conhecidos em
-          config.BENCHMARKS_M2, e extrai preço/área/quartos via regex sobre
-          o texto visível do card.
-        Anúncios sem indício de data relativa são descartados (não se
-        arrisca a comprovar a janela temporal por omissão)."""
+        encontrado (ex.: estrutura da página mudou, ou a página renderizada
+        é uma tela de bloqueio/captcha). Identifica cards por links de
+        detalhe do anúncio (padrão conhecido publicamente: URLs de anúncio
+        da OLX contêm "/vi/") — CONFIRMAR contra o HTML real."""
         soup = BeautifulSoup(html, "html.parser")
         candidatos = []
         vistos = set()
@@ -449,7 +501,14 @@ class OLXScraper(BaseScraper):
             card = link.find_parent(["section", "li", "article", "div"]) or link
             texto_card = card.get_text(" ", strip=True)
 
-            item = self._card_para_item(href, texto_card)
+            url = href if href.startswith("http") else f"https://www.olx.com.br{href}"
+            match_id = re.search(r"-(\d+)/?$", href.rstrip("/"))
+            id_origem = (
+                f"olx-{match_id.group(1)}" if match_id
+                else f"olx-{hashlib.sha1(href.encode('utf-8')).hexdigest()[:16]}"
+            )
+
+            item = self._card_generico_para_item(href, texto_card, url, id_origem)
             if item is None:
                 continue
 
@@ -459,175 +518,67 @@ class OLXScraper(BaseScraper):
 
         return candidatos
 
-    def _card_para_item(self, href: str, texto_card: str) -> dict | None:
-        data_publicacao = self._parse_data_relativa(texto_card)
-        if data_publicacao is None:
-            logger.info(
-                "descartado motivo=sem_indicio_de_data_no_card portal=%s url=%s",
-                self.portal, href,
-            )
-            return None
-
-        url = href if href.startswith("http") else f"https://www.olx.com.br{href}"
-        match_id = re.search(r"-(\d+)/?$", href.rstrip("/"))
-        id_origem = (
-            f"olx-{match_id.group(1)}" if match_id
-            else f"olx-{hashlib.sha1(href.encode('utf-8')).hexdigest()[:16]}"
-        )
-
-        preco_match = re.search(r"R\$\s*([\d.,]+)", texto_card)
-        preco = (
-            self._to_float_or_none(preco_match.group(1).replace(".", "").replace(",", "."))
-            if preco_match else None
-        )
-
-        area_match = re.search(r"(\d+)\s*m²", texto_card)
-        area_m2 = self._to_float_or_none(area_match.group(1)) if area_match else 0.0
-
-        quartos_match = re.search(r"(\d+)\s*quartos?\b", texto_card, re.IGNORECASE)
-        quartos = self._to_int_or_none(quartos_match.group(1)) if quartos_match else None
-
-        bairro = next(
-            (b for b in BENCHMARKS_M2 if b.lower() in texto_card.lower()), ""
-        )
-
-        preco_m2 = round(preco / area_m2, 2) if preco and area_m2 else None
-
-        return {
-            "id_origem": id_origem,
-            "portal": self.portal,
-            "titulo": texto_card[:200],
-            "preco": preco,
-            "area_m2": area_m2,
-            "preco_m2": preco_m2,
-            "quartos": quartos,
-            "bairro": bairro,
-            "url": url,
-            "descricao": texto_card,
-            "atributos_estruturados": [],
-            "data_criacao_anuncio": data_publicacao.isoformat(),
-            "data_criacao_anuncio_dt": data_publicacao,
-        }
-
-    _REGEX_HOJE = re.compile(r"\bhoje\b", re.IGNORECASE)
-    _REGEX_ONTEM = re.compile(r"\bontem\b", re.IGNORECASE)
-    _REGEX_HA_HORAS = re.compile(r"h[aá]\s*(\d+)\s*h(?:oras?)?\b", re.IGNORECASE)
-    _REGEX_HA_DIAS = re.compile(r"h[aá]\s*(\d+)\s*dias?\b", re.IGNORECASE)
-
-    @classmethod
-    def _parse_data_relativa(cls, texto: str) -> datetime | None:
-        # CONFIRMAR: formato exato dos badges de tempo relativo da OLX.
-        agora = datetime.now(timezone.utc)
-
-        if cls._REGEX_HOJE.search(texto):
-            return agora
-        if cls._REGEX_ONTEM.search(texto):
-            return agora - timedelta(days=1)
-
-        match = cls._REGEX_HA_HORAS.search(texto)
-        if match:
-            return agora - timedelta(hours=int(match.group(1)))
-
-        match = cls._REGEX_HA_DIAS.search(texto)
-        if match:
-            return agora - timedelta(days=int(match.group(1)))
-
-        return None
-
 
 class ZapVivaRealScraper(BaseScraper):
-    """Extrator de anúncios via endpoint público de busca do Grupo ZAP/VivaReal.
+    """Extrator de anúncios da página pública de busca do VivaReal (Grupo
+    ZAP/VivaReal).
 
-    O endpoint `glue-api.vivareal.com/v2/listings` é o utilizado publicamente
-    pelo próprio site (VivaReal e ZAP Imóveis compartilham a mesma origem de
-    dados) para popular resultados de busca via XHR. Os nomes de parâmetros
-    (incluindo `maxPrice`/`minBedrooms`, equivalentes a `max_price`/
-    `min_rooms`) e o caminho dos campos na resposta estão marcados como
-    CONFIRMAR: não puderam ser validados neste ambiente por bloqueio de
-    egress a vivareal.com.br/zapimoveis.com.br.
+    Versão anterior usava o endpoint interno `glue-api.vivareal.com/v2/
+    listings`, que retornou HTTP 400 persistente mesmo após ajuste de
+    headers — indício de parâmetro de consulta inválido/desatualizado do
+    lado do servidor. Esta versão faz scraping direto da página pública de
+    busca (`quartos`/`preco-ate` na própria URL), com o mesmo fallback via
+    Playwright usado pela OLX em caso de bloqueio 403. Os seletores de card
+    (identificados por links "/imovel/") e o formato dos badges de tempo
+    relativo estão marcados como CONFIRMAR: não puderam ser validados neste
+    ambiente por bloqueio de egress a vivareal.com.br.
     """
 
     portal = "zap_vivareal"
-    BASE_URL = "https://glue-api.vivareal.com/v2/listings"
+    BASE_URL = "https://www.vivareal.com.br/venda/espirito-santo/vitoria/apartamento_residencial/"
     PARAMS = {
-        "businessType": "SALE",
-        "unitTypes": "APARTMENT,HOME",
-        "addressCity": "Vitória",
-        "addressState": "Espírito Santo",
-        "addressCountry": "Brasil",
-        "sort": "most_recent",  # CONFIRMAR: valor exato do parâmetro de ordenação
-        "maxPrice": "750000",  # CONFIRMAR: equivalente a max_price
-        "minBedrooms": "3",  # CONFIRMAR: equivalente a min_rooms
-        "size": "50",
-        "from": "0",
+        "quartos": "3",
+        "preco-ate": "750000",
     }
 
     def extrair_recentes(self) -> list[dict]:
-        try:
-            resposta = requests.get(
-                self.BASE_URL, params=self.PARAMS, headers=HEADERS_ZAP, timeout=15
-            )
-            resposta.raise_for_status()
-            payload = resposta.json()
-        except (requests.RequestException, ValueError) as exc:
-            logger.error("falha_requisicao portal=%s erro=%s", self.portal, exc)
+        html = self._buscar_html_com_fallback_playwright(self.BASE_URL, self.PARAMS)
+        if html is None:
             return []
 
-        resultados = self._localizar_lista_resultados(payload)
-        candidatos = [
-            item
-            for resultado in resultados
-            if (item := self._normalizar_resultado(resultado)) is not None
-        ]
+        candidatos = self._extrair_cards_html(html)
         return self._filtrar_e_logar(candidatos)
 
-    @staticmethod
-    def _localizar_lista_resultados(payload: dict) -> list[dict]:
-        # CONFIRMAR: caminho exato do JSON de resposta do glue-api.
-        return payload.get("search", {}).get("result", {}).get("listings", []) or []
+    def _extrair_cards_html(self, html: str) -> list[dict]:
+        """CONFIRMAR: seletor de cards não pôde ser validado contra o site
+        real. Heurística: links de detalhe do anúncio contêm "/imovel/"
+        (padrão publicamente conhecido de URLs de anúncio do VivaReal)."""
+        soup = BeautifulSoup(html, "html.parser")
+        candidatos = []
+        vistos = set()
 
-    def _normalizar_resultado(self, resultado: dict) -> dict | None:
-        try:
-            listagem = resultado.get("listing", {})
-            id_origem = f"zap-{listagem['id']}"
-            data_publicacao = self._parse_data_iso(
-                listagem.get("updatedAt") or listagem.get("createdAt")
+        for link in soup.select('a[href*="/imovel/"]'):
+            href = link.get("href", "")
+            if not href or href in vistos:
+                continue
+            vistos.add(href)
+
+            card = link.find_parent(["section", "li", "article", "div"]) or link
+            texto_card = card.get_text(" ", strip=True)
+
+            url = href if href.startswith("http") else f"https://www.vivareal.com.br{href}"
+            match_id = re.search(r"-(\d+)/?$", href.rstrip("/")) or re.search(r"id-?(\d+)", href, re.IGNORECASE)
+            id_origem = (
+                f"zap-{match_id.group(1)}" if match_id
+                else f"zap-{hashlib.sha1(href.encode('utf-8')).hexdigest()[:16]}"
             )
-            preco = self._to_float_or_none(
-                (listagem.get("pricingInfos") or [{}])[0].get("price")
-            )
-            area_m2 = self._to_float_or_none((listagem.get("usableAreas") or [None])[0]) or 0.0
-            # CONFIRMAR: chave de quartos e de comodidades estruturadas.
-            quartos = self._to_int_or_none((listagem.get("bedrooms") or [None])[0])
-            atributos_estruturados = listagem.get("amenities") or []
-            endereco = listagem.get("address", {})
-            bairro = endereco.get("neighborhood", "")
-            url = f"https://www.vivareal.com.br/imovel/{listagem['id']}/"
-            titulo = listagem.get("title", "")
-            descricao = listagem.get("description", "")
-        except (KeyError, IndexError, TypeError, ValueError) as exc:
-            logger.warning("descartado motivo=erro_parse portal=%s erro=%s", self.portal, exc)
-            return None
 
-        if data_publicacao is None:
-            return None
+            item = self._card_generico_para_item(href, texto_card, url, id_origem)
+            if item is None:
+                continue
 
-        preco_m2 = round(preco / area_m2, 2) if preco and area_m2 else None
+            item_finalizado = self._finalizar_item(item)
+            if item_finalizado is not None:
+                candidatos.append(item_finalizado)
 
-        item = {
-            "id_origem": id_origem,
-            "portal": self.portal,
-            "titulo": titulo,
-            "preco": preco,
-            "area_m2": area_m2,
-            "preco_m2": preco_m2,
-            "quartos": quartos,
-            "bairro": bairro,
-            "url": url,
-            "descricao": descricao,
-            "atributos_estruturados": atributos_estruturados,
-            "data_criacao_anuncio": data_publicacao.isoformat(),
-            "data_criacao_anuncio_dt": data_publicacao,
-        }
-
-        return self._finalizar_item(item)
+        return candidatos
