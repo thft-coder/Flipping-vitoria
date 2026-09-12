@@ -24,16 +24,33 @@ def _formatar_reais(valor: float | None) -> str:
     return f"R$ {texto}"
 
 
+# Caracteres especiais do Markdown legado do Telegram (parse_mode="Markdown").
+# Sem escapar, um "_" ou "*" desbalanceado em texto dinâmico (título/URL de
+# um anúncio real, por exemplo) faz a API inteira retornar 400 Bad Request
+# ("can't parse entities") — o alerta falharia silenciosamente em produção.
+_CARACTERES_MARKDOWN_LEGADO = "_*`["
+
+
+def _escapar_markdown(texto) -> str:
+    texto = str(texto)
+    for caractere in _CARACTERES_MARKDOWN_LEGADO:
+        texto = texto.replace(caractere, f"\\{caractere}")
+    return texto
+
+
 def _formatar_mensagem(imovel: dict) -> str:
-    bairro = imovel.get("bairro", "N/D")
+    bairro = _escapar_markdown(imovel.get("bairro") or "N/D")
     quartos = imovel.get("quartos", "N/D")
     preco_fmt = _formatar_reais(imovel.get("preco"))
     preco_m2_fmt = _formatar_reais(imovel.get("preco_m2"))
     mediana_fmt = _formatar_reais(imovel.get("mediana_referencia_m2"))
     desconto_percentual = imovel.get("desconto_percentual")
     desconto_fmt = f"{desconto_percentual:.2f}%" if desconto_percentual is not None else "N/D"
-    gatilho_aprovacao = imovel.get("gatilho_aprovacao", "N/D")
-    url = imovel.get("url", "N/D")
+    gatilho_aprovacao = _escapar_markdown(imovel.get("gatilho_aprovacao") or "N/D")
+    # A URL não é escapada: fica dentro de "(...)" da sintaxe de link
+    # [texto](url) do Markdown, cujo conteúdo é tratado como destino literal
+    # (não reparsing de entidades) — escapar aqui quebraria o link.
+    url = imovel.get("url") or "N/D"
     # Elevador não é mais critério eliminatório (config.EXIGIR_ELEVADOR):
     # reflete o que foi de fato comprovado no anúncio, sem presumir.
     elevador_status = "Confirmada" if imovel.get("elevador") else "Não confirmada no anúncio"
@@ -47,7 +64,7 @@ def _formatar_mensagem(imovel: dict) -> str:
         f"*Preço/m²:* {preco_m2_fmt}\n"
         f"*Desconto vs. Mediana:* {desconto_fmt} (mediana do bairro: {mediana_fmt}/m²)\n"
         f"*Gatilho de disparo:* {gatilho_aprovacao}\n"
-        f"*Anúncio:* {url}"
+        f"*Anúncio:* [Ver anúncio]({url})"
     )
 
 

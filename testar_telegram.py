@@ -15,7 +15,10 @@ IMOVEL_TESTE = {
     "preco_m2": 5000.0,
     "mediana_referencia_m2": 7500,
     "desconto_percentual": 33.33,
-    "gatilho_aprovacao": "teste manual de notificação (scripts/testar_telegram.py)",
+    # O "_" em "testar_telegram.py" é propositalmente mantido aqui: serve de
+    # teste de regressão para o escaping de Markdown em notifier.py (um "_"
+    # sem escape quebra o parse_mode="Markdown" do Telegram com 400).
+    "gatilho_aprovacao": "teste manual de notificação (testar_telegram.py)",
     "url": "https://exemplo.com/anuncio-de-teste",
 }
 
