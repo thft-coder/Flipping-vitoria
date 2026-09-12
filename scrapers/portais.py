@@ -316,6 +316,7 @@ class OLXScraper(BaseScraper):
             return None
 
         item.pop("atributos_estruturados", None)
+        item["elevador"] = True
         return item
 
 
@@ -418,4 +419,5 @@ class ZapVivaRealScraper(BaseScraper):
             return None
 
         item.pop("atributos_estruturados", None)
+        item["elevador"] = True
         return item

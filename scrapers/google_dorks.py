@@ -32,7 +32,7 @@ from datetime import datetime, timezone
 import requests
 from dotenv import load_dotenv
 
-from config import BAIRROS_ALVO, JANELA_MAX_HORAS
+from config import BENCHMARKS_M2, JANELA_MAX_HORAS
 from scrapers.portais import validar_presenca_elevador
 
 load_dotenv()
@@ -53,7 +53,7 @@ TERMOS_QUARTOS = ["3 quartos", "3 dorms", "3 qts"]
 # "motivo de mudança"), conforme especificado para esta consulta.
 TERMOS_OPORTUNIDADE_DORK = ["reforma", "original", "inventário", "urgente"]
 
-BAIRROS_PRIORITARIOS = list(BAIRROS_ALVO.keys())
+BAIRROS_PRIORITARIOS = list(BENCHMARKS_M2.keys())
 
 
 def _clausula_or(termos: list[str]) -> str:
@@ -154,5 +154,6 @@ class GoogleDorksScraper:
             "titulo": titulo,
             "url": url,
             "snippet": snippet,
+            "elevador": True,
             "data_coleta": datetime.now(timezone.utc).isoformat(),
         }

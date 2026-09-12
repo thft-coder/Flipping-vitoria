@@ -5,8 +5,9 @@ import re
 # Janela máxima de tempo (em horas) para considerar um anúncio como válido
 JANELA_MAX_HORAS = 48
 
-# Bairros-alvo em Vitória (ES) e suas medianas estimadas de preço por m² (R$)
-BAIRROS_ALVO = {
+# Bairros-alvo em Vitória (ES) e suas medianas estimadas de preço por m² (R$),
+# usadas como benchmark para o cálculo de desconto no motor de análise
+BENCHMARKS_M2 = {
     "Jardim da Penha": 7500,
     "Praia do Canto": 11000,
     "Mata da Praia": 10500,
@@ -31,6 +32,10 @@ REGEX_OPORTUNIDADE = re.compile(
 
 # Desconto mínimo (fração) exigido em relação à mediana de R$/m² do bairro
 THRESHOLD_DESCONTO_MINIMO = 0.25
+
+# Desconto mínimo (fração) aceito quando o texto contém termos de
+# oportunidade (regra de aprovação mais permissiva)
+THRESHOLD_DESCONTO_OPORTUNIDADE = 0.15
 
 # Preço máximo (R$) aceito para um imóvel ser considerado
 PRECO_MAXIMO = 750000.0
