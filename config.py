@@ -31,3 +31,25 @@ REGEX_OPORTUNIDADE = re.compile(
 
 # Desconto mínimo (fração) exigido em relação à mediana de R$/m² do bairro
 THRESHOLD_DESCONTO_MINIMO = 0.25
+
+# Preço máximo (R$) aceito para um imóvel ser considerado
+PRECO_MAXIMO = 750000.0
+
+# Quantidade mínima de quartos exigida
+QUARTOS_MINIMO = 3
+
+# Exigir presença de elevador no edifício
+EXIGIR_ELEVADOR = True
+
+# Termos e comodidades usados para identificar elevador em descrições ou
+# atributos técnicos do anúncio
+TERMOS_ELEVADOR = [
+    "elevador",
+    "com elevador",
+    "edifício com elevador",
+]
+
+REGEX_ELEVADOR = re.compile(
+    "|".join(re.escape(termo) for termo in TERMOS_ELEVADOR),
+    re.IGNORECASE,
+)
