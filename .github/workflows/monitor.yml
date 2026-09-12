@@ -35,8 +35,6 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
-          GOOGLE_CSE_ID: ${{ secrets.GOOGLE_CSE_ID }}
         run: python main.py
 
       # Diagnóstico: só existe arquivo se scrapers/portais.py detectou
