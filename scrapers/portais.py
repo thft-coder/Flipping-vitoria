@@ -852,80 +852,81 @@ class ZapVivaRealScraper(BaseScraper):
     Versão anterior usava o endpoint interno `glue-api.vivareal.com/v2/
     listings`, que retornou HTTP 400 persistente mesmo após ajuste de
     headers — indício de parâmetro de consulta inválido/desatualizado do
-    lado do servidor. Esta versão faz scraping direto da página pública de
-    busca (`quartos`/`preco-ate`/`ordem` na própria URL), com o mesmo
-    fallback via Playwright usado pela OLX em caso de bloqueio 403.
+    lado do servidor. Depois disso, uma busca genérica (`quartos`/
+    `preco-ate`/`price-max`/`ordem` na URL raiz) mostrou, em execução real,
+    que o servidor ignora completamente o filtro de preço: todos os cards
+    retornados vinham acima do limite, mesmo com o parâmetro na URL,
+    saturando as primeiras páginas com imóveis de alto padrão.
 
-    Validado em execução real (GitHub Actions): a requisição direta (sem
-    Playwright) já retorna ~20 cards reais da página, com preço/área/bairro
-    corretos. Porém os cards de busca do VivaReal não expõem nenhum badge
-    de "publicado há X" (diferente da OLX) — por isso este scraper NÃO
-    exige comprovação de data relativa no card (veja
-    `exigir_data_relativa=False` em `_extrair_cards_html`). A "novidade" do
-    anúncio passa a depender de dois fatores: (1) o parâmetro `ordem`
-    pedindo ordenação pelos mais recentes primeiro, e (2) a deduplicação
-    por id_origem em database.py — um anúncio só gera alerta na primeira
-    vez que aparecer na busca. Isso significa que um anúncio antigo que
-    ainda apareça na primeira página de resultados pode ser processado; o
-    parâmetro `ordem` é a única mitigação para isso e seu nome exato está
-    marcado como CONFIRMAR (assim como o seletor de card "/imovel/").
+    Refatorado para busca direcionada por bairro (mesmo padrão aplicado à
+    OLX), usando a rota de bairro do VivaReal
+    (`/bairros/<slug>/apartamento_residencial/`) com `ordem=preco-menor`.
+    Diferente da tentativa anterior (`ordem=data-decrescente`, sem
+    relação com preço), ordenar por preço crescente ataca diretamente o
+    problema da saturação por imóveis caros no topo: mesmo que o servidor
+    não filtre por PRECO_MAXIMO, a primeira página de cada bairro tende a
+    trazer primeiro os imóveis mais baratos daquele bairro específico.
+
+    CONFIRMAR (não validado contra uma resposta real ainda): a rota
+    `/bairros/<slug>/`, o parâmetro `ordem=preco-menor` e o parâmetro de
+    paginação `pagina`. Preço, quartos e demais critérios continuam sendo
+    garantidos do nosso lado em _aplicar_criterios_obrigatorios,
+    independentemente do que o servidor filtrar ou não. Os cards de busca
+    do VivaReal não expõem badge de "publicado há X" (diferente da OLX)
+    — por isso este scraper não exige comprovação de data relativa no
+    card (`exigir_data_relativa=False` em `_extrair_cards_html`); a
+    "novidade" do anúncio depende da deduplicação por id_origem em
+    database.py.
     """
 
     portal = "zap_vivareal"
-    BASE_URL = "https://www.vivareal.com.br/venda/espirito-santo/vitoria/apartamento_residencial/"
-    # CONFIRMAR: tanto "preco-ate" quanto "price-max" já foram testados
-    # como nome do parâmetro de preço, e nas duas execuções reais o
-    # servidor ignorou o filtro (cards retornados sempre acima do limite,
-    # mesmo com o parâmetro na URL) — indício de que a listagem pública do
-    # VivaReal não filtra por preço via query string na rota raiz. Por
-    # isso o filtro de preço NÃO é mais uma garantia esperada do lado do
-    # servidor: é só um hint best-effort mantido na URL, e a garantia real
-    # continua sendo inteiramente client-side, em
-    # _aplicar_criterios_obrigatorios (preco > PRECO_MAXIMO é descartado
-    # de qualquer forma, confirmado funcionando nos logs reais).
-    PARAMS = {
-        "quartos": "3",
-        "preco-ate": "750000",
-        "ordem": "data-decrescente",  # CONFIRMAR: nome exato do parâmetro de ordenação por mais recentes
+
+    # Mapeamento bairro (nome oficial, mesmo usado em config.BENCHMARKS_M2)
+    # -> slug estruturado usado pela URL de busca por bairro do VivaReal.
+    BAIRRO_SLUGS = {
+        "Jardim da Penha": "jardim-da-penha",
+        "Praia do Canto": "praia-do-canto",
+        "Mata da Praia": "mata-da-praia",
+        "Bento Ferreira": "bento-ferreira",
+        "Jardim Camburi": "jardim-camburi",
     }
-    # Como o servidor não filtra por preço, aumenta-se o volume de cards
-    # inspecionados por execução (varrendo mais páginas) para chegar aos
-    # imóveis mais baratos, que tendem a ficar afastados do topo de uma
-    # busca ordenada só por "mais recentes". Nome do parâmetro de página
-    # marcado CONFIRMAR: não verificado contra uma resposta real ainda.
-    PAGINAS_MAX = 2
-    # Fragmento (#) da URL original fornecida. Fragmentos não são enviados
-    # ao servidor em uma requisição HTTP comum (só são interpretados pelo
-    # navegador) — por isso não têm efeito no caminho via `requests`. É
-    # incluído aqui só para o fallback via Playwright (ver `fragmento` em
-    # `_buscar_html_com_fallback_playwright`), caso a SPA leia
-    # `location.hash` do lado do cliente para aplicar esse filtro; não há
-    # confirmação de que isso realmente ocorra.
-    URL_FRAGMENTO = "#preco-ate=750000"
+
+    PAGINAS_POR_BAIRRO = 2
+
+    # Atraso entre trocas de bairro, para reduzir o risco de rate limit
+    # por repetição de requisições automatizadas em sequência rápida.
+    DELAY_ENTRE_BAIRROS_SEGUNDOS = 2
 
     def extrair_recentes(self) -> list[dict]:
         candidatos_totais: list[dict] = []
 
-        for pagina in range(1, self.PAGINAS_MAX + 1):
-            params = dict(self.PARAMS)
-            if pagina > 1:
-                params["pagina"] = str(pagina)  # CONFIRMAR: nome do parâmetro de paginação
-
-            html = self._buscar_html_com_fallback_playwright(
-                self.BASE_URL, params, fragmento=self.URL_FRAGMENTO
-            )
-            if html is None:
-                logger.warning(
-                    "pagina_sem_html portal=%s pagina=%d", self.portal, pagina
+        bairros = list(self.BAIRRO_SLUGS.items())
+        for indice, (bairro, slug) in enumerate(bairros):
+            for pagina in range(1, self.PAGINAS_POR_BAIRRO + 1):
+                url = (
+                    f"https://www.vivareal.com.br/venda/espirito-santo/vitoria/"
+                    f"bairros/{slug}/apartamento_residencial/?ordem=preco-menor"
                 )
-                continue
+                if pagina > 1:
+                    url += f"&pagina={pagina}"  # CONFIRMAR: nome do parâmetro de paginação
 
-            candidatos = self._extrair_cards_html(html)
-            logger.info(
-                "pagina_processada portal=%s pagina=%d candidatos=%d",
-                self.portal, pagina, len(candidatos),
-            )
-            candidatos_totais.extend(candidatos)
+                html = self._buscar_html_com_fallback_playwright(url, {})
+                if html is None:
+                    logger.warning(
+                        "pagina_sem_html portal=%s bairro=%s pagina=%d",
+                        self.portal, bairro, pagina,
+                    )
+                    continue
+
+                candidatos = self._extrair_cards_html(html)
+                logger.info(
+                    "pagina_processada portal=%s bairro=%s pagina=%d candidatos=%d",
+                    self.portal, bairro, pagina, len(candidatos),
+                )
+                candidatos_totais.extend(candidatos)
+
+            if indice < len(bairros) - 1:
+                time.sleep(self.DELAY_ENTRE_BAIRROS_SEGUNDOS)
 
         return self._filtrar_e_logar(candidatos_totais)
 
