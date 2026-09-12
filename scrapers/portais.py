@@ -282,20 +282,39 @@ class BaseScraper(ABC):
             logger.error("falha_playwright portal=%s erro=%s", self.portal, exc)
             return None
 
-    def _card_generico_para_item(self, href: str, texto_card: str, url_absoluta: str, id_origem: str) -> dict | None:
+    def _card_generico_para_item(
+        self,
+        href: str,
+        texto_card: str,
+        url_absoluta: str,
+        id_origem: str,
+        *,
+        exigir_data_relativa: bool = True,
+    ) -> dict | None:
         """Constrói um item a partir do texto visível de um card de listagem
         (usado pelos fallbacks HTML da OLX e do ZAP/VivaReal). Extrai preço,
-        área, quartos e bairro via regex/casamento de texto, e a data de
-        publicação a partir de badges de tempo relativo. Retorna None se não
-        houver indício de data (não se arrisca a comprovar a janela temporal
-        por omissão) — CONFIRMAR os formatos exatos contra o site real."""
-        data_publicacao = self._parse_data_relativa(texto_card)
-        if data_publicacao is None:
-            logger.info(
-                "descartado motivo=sem_indicio_de_data_no_card portal=%s url=%s",
-                self.portal, href,
-            )
-            return None
+        área, quartos e bairro via regex/casamento de texto.
+
+        Se `exigir_data_relativa` for True (padrão, usado pela OLX), a data
+        de publicação vem de badges de tempo relativo no card ("Hoje",
+        "Ontem", "há Xh") e o item é descartado sem esse indício — não se
+        arrisca a comprovar a janela temporal por omissão. Se for False
+        (usado pelo ZAP/VivaReal, cujos cards de busca não expõem esse
+        badge), a "novidade" passa a depender inteiramente da combinação
+        busca ordenada por mais recentes + deduplicação por id_origem no
+        database.py: usa-se o momento da coleta como data_criacao_anuncio,
+        o que sempre passa no filtro de janela — o controle real de
+        duplicidade fica a cargo de database.ja_processado."""
+        if exigir_data_relativa:
+            data_publicacao = self._parse_data_relativa(texto_card)
+            if data_publicacao is None:
+                logger.info(
+                    "descartado motivo=sem_indicio_de_data_no_card portal=%s url=%s",
+                    self.portal, href,
+                )
+                return None
+        else:
+            data_publicacao = datetime.now(timezone.utc)
 
         preco_match = re.search(r"R\$\s*([\d.,]+)", texto_card)
         preco = (
@@ -527,11 +546,22 @@ class ZapVivaRealScraper(BaseScraper):
     listings`, que retornou HTTP 400 persistente mesmo após ajuste de
     headers — indício de parâmetro de consulta inválido/desatualizado do
     lado do servidor. Esta versão faz scraping direto da página pública de
-    busca (`quartos`/`preco-ate` na própria URL), com o mesmo fallback via
-    Playwright usado pela OLX em caso de bloqueio 403. Os seletores de card
-    (identificados por links "/imovel/") e o formato dos badges de tempo
-    relativo estão marcados como CONFIRMAR: não puderam ser validados neste
-    ambiente por bloqueio de egress a vivareal.com.br.
+    busca (`quartos`/`preco-ate`/`ordem` na própria URL), com o mesmo
+    fallback via Playwright usado pela OLX em caso de bloqueio 403.
+
+    Validado em execução real (GitHub Actions): a requisição direta (sem
+    Playwright) já retorna ~20 cards reais da página, com preço/área/bairro
+    corretos. Porém os cards de busca do VivaReal não expõem nenhum badge
+    de "publicado há X" (diferente da OLX) — por isso este scraper NÃO
+    exige comprovação de data relativa no card (veja
+    `exigir_data_relativa=False` em `_extrair_cards_html`). A "novidade" do
+    anúncio passa a depender de dois fatores: (1) o parâmetro `ordem`
+    pedindo ordenação pelos mais recentes primeiro, e (2) a deduplicação
+    por id_origem em database.py — um anúncio só gera alerta na primeira
+    vez que aparecer na busca. Isso significa que um anúncio antigo que
+    ainda apareça na primeira página de resultados pode ser processado; o
+    parâmetro `ordem` é a única mitigação para isso e seu nome exato está
+    marcado como CONFIRMAR (assim como o seletor de card "/imovel/").
     """
 
     portal = "zap_vivareal"
@@ -539,7 +569,14 @@ class ZapVivaRealScraper(BaseScraper):
     PARAMS = {
         "quartos": "3",
         "preco-ate": "750000",
+        "ordem": "data-decrescente",  # CONFIRMAR: nome exato do parâmetro de ordenação por mais recentes
     }
+    # A URL fornecida também incluía um fragmento "#onde=...": fragmentos
+    # (#) são interpretados só no navegador (client-side, ex.: para
+    # pré-preencher o mapa) e nunca são enviados ao servidor em uma
+    # requisição HTTP — por isso foram omitidos aqui, já que não têm efeito
+    # sobre a página retornada por requests.get nem pelo Playwright em modo
+    # de navegação simples.
 
     def extrair_recentes(self) -> list[dict]:
         html = self._buscar_html_com_fallback_playwright(self.BASE_URL, self.PARAMS)
@@ -573,7 +610,9 @@ class ZapVivaRealScraper(BaseScraper):
                 else f"zap-{hashlib.sha1(href.encode('utf-8')).hexdigest()[:16]}"
             )
 
-            item = self._card_generico_para_item(href, texto_card, url, id_origem)
+            item = self._card_generico_para_item(
+                href, texto_card, url, id_origem, exigir_data_relativa=False
+            )
             if item is None:
                 continue
 
