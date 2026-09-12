@@ -696,7 +696,14 @@ class OLXScraper(BaseScraper):
                 else f"olx-{hashlib.sha1(href.encode('utf-8')).hexdigest()[:16]}"
             )
 
-            item = self._card_generico_para_item(href, texto_card, url, id_origem)
+            # exigir_data_relativa=False: confirmado em produção que os
+            # cards de busca da OLX (assim como os do ZAP/VivaReal) não
+            # expõem badge de "publicado há X" — todos os anúncios reais
+            # eram descartados por sem_indicio_de_data_no_card antes desta
+            # mudança. A "novidade" passa a depender de database.ja_processado.
+            item = self._card_generico_para_item(
+                href, texto_card, url, id_origem, exigir_data_relativa=False
+            )
             if item is None:
                 continue
 
