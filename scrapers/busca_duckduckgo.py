@@ -43,14 +43,19 @@ from scrapers.portais import validar_presenca_elevador
 logger = logging.getLogger(__name__)
 
 # Termos mandatórios para quantidade de quartos (Regra: exatamente esta
-# cláusula OR deve constar na busca).
-TERMOS_QUARTOS = ["3 quartos", "3 dorms", "3 qts"]
+# cláusula OR deve constar na busca). Ampliado para cobrir variações
+# léxicas comuns em anúncios classificados (abreviações e sinônimos),
+# além da forma completa.
+TERMOS_QUARTOS = [
+    "3 quartos", "3 dormitórios", "3 dorms", "3 qts", "3Q", "tres quartos",
+]
 
 # Termos de oportunidade específicos para esta busca. É um subconjunto
 # curado de config.TERMOS_OPORTUNIDADE (que também inclui "partilha" e
-# "motivo de mudança"), conforme especificado originalmente para esta
-# consulta.
-TERMOS_OPORTUNIDADE_DORK = ["reforma", "original", "inventário", "urgente"]
+# "motivo de mudança"), acrescido de "oportunidade" e "desocupado".
+TERMOS_OPORTUNIDADE_DORK = [
+    "reforma", "original", "inventário", "oportunidade", "urgente", "desocupado",
+]
 
 BAIRROS_PRIORITARIOS = list(BENCHMARKS_M2.keys())
 
@@ -84,11 +89,16 @@ def montar_query() -> str:
 
 class DuckDuckGoScraper:
     """Busca oportunidades via DuckDuckGo usando uma query combinando os
-    critérios de quartos, elevador, segmentação geográfica e termos de
-    oportunidade. Não possui filtro temporal server-side confiável (o
-    parâmetro `timelimit` do DuckDuckGo tem granularidade de dia/semana/
-    mês/ano, não é possível pedir exatamente 48h) — usa "d" (último dia)
-    como aproximação mais restritiva disponível."""
+    critérios de quartos, segmentação geográfica e termos de oportunidade.
+
+    Não usa mais o parâmetro `timelimit` do DuckDuckGo (removido: uma
+    execução real em produção mostrou 0 resultados mesmo após afrouxar a
+    query, com `timelimit="d"` restringindo a busca a conteúdo indexado
+    nas últimas 24h — a interseção entre "indexado há <1 dia" e "contém uma
+    das frases exatas buscadas" é um filtro muito mais restritivo do que
+    parece à primeira vista). A garantia de novidade passa a depender
+    inteiramente da deduplicação por id_origem em database.py, do mesmo
+    modo já usado pelo ZAP/VivaReal e pelo fallback HTML da OLX."""
 
     portal = "duckduckgo"
 
@@ -100,7 +110,6 @@ class DuckDuckGoScraper:
             resultados = DDGS(timeout=15).text(
                 self.query,
                 region="br-pt",
-                timelimit="d",
                 max_results=10,
                 backend="duckduckgo",
             )
