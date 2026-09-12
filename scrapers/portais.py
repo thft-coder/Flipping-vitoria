@@ -23,6 +23,7 @@ import json
 import logging
 import re
 from abc import ABC, abstractmethod
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode
 
@@ -278,9 +279,11 @@ class BaseScraper(ABC):
 
     def _salvar_html_diagnostico(self, html: str) -> None:
         """Salva o HTML recebido em disco (debug_<portal>_html.html) para
-        inspeção posterior via artifact do GitHub Actions — usado só quando
-        a extração normal falha, para permitir diagnosticar a estrutura
-        real da página em vez de seguir supondo seletores às cegas."""
+        inspeção via artifact do GitHub Actions, e loga um resumo
+        estrutural (ids de <script>, prefixos de href mais comuns,
+        presença de termos-chave) diretamente no log do job — usado só
+        quando a extração normal falha, para diagnosticar a estrutura real
+        da página em vez de seguir supondo seletores às cegas."""
         caminho = f"debug_{self.portal}_html.html"
         try:
             with open(caminho, "w", encoding="utf-8") as arquivo:
@@ -288,6 +291,38 @@ class BaseScraper(ABC):
             logger.info("html_diagnostico_salvo portal=%s caminho=%s", self.portal, caminho)
         except OSError as exc:
             logger.warning("falha_salvar_html_diagnostico portal=%s erro=%s", self.portal, exc)
+
+        self._logar_resumo_estrutural(html)
+
+    def _logar_resumo_estrutural(self, html: str) -> None:
+        soup = BeautifulSoup(html, "html.parser")
+
+        ids_de_script = [s.get("id") for s in soup.find_all("script") if s.get("id")]
+        logger.info(
+            "diagnostico_scripts_com_id portal=%s total=%d ids=%r",
+            self.portal, len(ids_de_script), ids_de_script[:20],
+        )
+
+        hrefs = [a.get("href", "") for a in soup.find_all("a", href=True)]
+        prefixos = Counter(
+            href.split("?")[0].rsplit("/", 1)[0]
+            for href in hrefs
+            if href.startswith("/") and href.count("/") >= 2
+        )
+        logger.info(
+            "diagnostico_prefixos_href portal=%s total_links=%d mais_comuns=%r",
+            self.portal, len(hrefs), prefixos.most_common(15),
+        )
+
+        texto_lower = html.lower()
+        logger.info(
+            "diagnostico_termos_chave portal=%s contem_quartos=%s contem_preco=%s "
+            "contem_apartamento=%s",
+            self.portal,
+            "quartos" in texto_lower,
+            "r$" in texto_lower,
+            "apartamento" in texto_lower,
+        )
 
     def _buscar_html_via_playwright(self, url: str, selector_espera: str | None = None) -> str | None:
         """Renderiza a página com Chromium headless (Playwright) para
