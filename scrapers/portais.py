@@ -574,8 +574,11 @@ class OLXScraper(BaseScraper):
     BASE_URL = "https://www.olx.com.br/imoveis/venda/estado-es/grande-vitoria/vitoria"
     PARAMS: dict = {}
     # Espera (fallback Playwright) por qualquer um destes indícios de
-    # conteúdo real carregado — CONFIRMAR os seletores contra o site real.
-    SELECTOR_ESPERA = 'script#__NEXT_DATA__, div[data-ds-component="DS-AdCard"], a[href*="/vi/"]'
+    # conteúdo carregado. "a[href*=/imoveis/]" é confirmado via diagnóstico
+    # real (links de anúncio contêm esse trecho), mas CSS não expressa a
+    # condição extra de terminar em ID numérico (ver _REGEX_LINK_ANUNCIO) —
+    # esse seletor pode bater em links de navegação/categoria também.
+    SELECTOR_ESPERA = 'script#__NEXT_DATA__, div[data-ds-component="DS-AdCard"], a[href*="/imoveis/"]'
 
     def extrair_recentes(self) -> list[dict]:
         html = self._buscar_html_com_fallback_playwright(
@@ -660,19 +663,26 @@ class OLXScraper(BaseScraper):
 
         return self._finalizar_item(item)
 
+    # Confirmado via diagnóstico estrutural real (execução em produção): os
+    # links de anúncio da OLX estão em domínio regional (ex.: es.olx.com.br,
+    # não www.olx.com.br), caminho "/imoveis/<slug-descritivo>-<id>", e
+    # terminam em sequência longa de dígitos — nunca contêm "/vi/", que era
+    # uma suposição incorreta (nunca confirmada) usada nas versões anteriores.
+    _REGEX_LINK_ANUNCIO = re.compile(r"-\d{6,}/?(?:\?.*)?$")
+
     def _extrair_cards_html(self, html: str) -> list[dict]:
         """Fallback de última instância quando o JSON embutido não é
         encontrado (ex.: estrutura da página mudou, ou a página renderizada
-        é uma tela de bloqueio/captcha). Identifica cards por links de
-        detalhe do anúncio (padrão conhecido publicamente: URLs de anúncio
-        da OLX contêm "/vi/") — CONFIRMAR contra o HTML real."""
+        é uma tela de bloqueio/captcha). Identifica cards por links contendo
+        "/imoveis/" cujo caminho termina em ID numérico longo — padrão
+        confirmado contra o HTML real da OLX."""
         soup = BeautifulSoup(html, "html.parser")
         candidatos = []
         vistos = set()
 
-        for link in soup.select('a[href*="/vi/"]'):
+        for link in soup.select('a[href*="/imoveis/"]'):
             href = link.get("href", "")
-            if not href or href in vistos:
+            if not href or not self._REGEX_LINK_ANUNCIO.search(href) or href in vistos:
                 continue
             vistos.add(href)
 
