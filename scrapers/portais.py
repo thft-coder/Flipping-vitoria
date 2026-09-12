@@ -168,8 +168,9 @@ class BaseScraper(ABC):
 
         if preco is None:
             logger.info(
-                "descartado motivo=preco_desconhecido portal=%s id_origem=%s",
-                self.portal, id_origem,
+                "descartado motivo=preco_desconhecido portal=%s id_origem=%s "
+                "amostra_texto=%r",
+                self.portal, id_origem, (item.get("descricao") or "")[:300],
             )
             return False
 
@@ -553,6 +554,38 @@ class BaseScraper(ABC):
         except (TypeError, ValueError):
             return None
 
+    # Tags candidatas a "card completo" de um anúncio, na varredura de
+    # ancestrais do link (ver _localizar_container_do_card).
+    _TAGS_CARD_ANUNCIO = ("section", "li", "article", "div")
+
+    def _localizar_container_do_card(self, link, max_niveis: int = 8):
+        """Sobe pela árvore de ancestrais do link do anúncio procurando o
+        contêiner cujo texto contenha "R$" (preço).
+
+        Correção de bug: a versão anterior (`link.find_parent([...]) or
+        link`) parava no PRIMEIRO ancestral cuja tag batesse em
+        _TAGS_CARD_ANUNCIO, mesmo que esse ancestral fosse apenas um
+        wrapper estreito em torno do link (ex.: `<div><a>título</a></div>`
+        imediatamente dentro do card real, sem preço) — isso descartava
+        anúncios reais como `preco_desconhecido` mesmo quando o preço
+        estava presente no HTML, só que em um nível mais acima. Agora a
+        busca continua subindo até achar um ancestral com "R$" no texto,
+        até `max_niveis`; se nenhum tiver preço, cai de volta ao último
+        ancestral válido encontrado (comportamento anterior) para não
+        piorar os demais campos (área, quartos, bairro)."""
+        ancestral = link.parent
+        ultimo_valido = None
+        nivel = 0
+        while ancestral is not None and nivel < max_niveis:
+            nome_tag = getattr(ancestral, "name", None)
+            if nome_tag in self._TAGS_CARD_ANUNCIO:
+                ultimo_valido = ancestral
+                if "R$" in ancestral.get_text(" ", strip=True):
+                    return ancestral
+            ancestral = ancestral.parent
+            nivel += 1
+        return ultimo_valido or link
+
 
 class OLXScraper(BaseScraper):
     """Extrator de anúncios de apartamentos e casas em Vitória-ES na OLX.
@@ -686,7 +719,7 @@ class OLXScraper(BaseScraper):
                 continue
             vistos.add(href)
 
-            card = link.find_parent(["section", "li", "article", "div"]) or link
+            card = self._localizar_container_do_card(link)
             texto_card = card.get_text(" ", strip=True)
 
             url = href if href.startswith("http") else f"https://www.olx.com.br{href}"
@@ -776,7 +809,7 @@ class ZapVivaRealScraper(BaseScraper):
                 continue
             vistos.add(href)
 
-            card = link.find_parent(["section", "li", "article", "div"]) or link
+            card = self._localizar_container_do_card(link)
             texto_card = card.get_text(" ", strip=True)
 
             url = href if href.startswith("http") else f"https://www.vivareal.com.br{href}"
