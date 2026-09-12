@@ -662,30 +662,56 @@ class OLXScraper(BaseScraper):
     # esse seletor pode bater em links de navegação/categoria também.
     SELECTOR_ESPERA = 'script#__NEXT_DATA__, div[data-ds-component="DS-AdCard"], a[href*="/imoveis/"]'
 
+    # A URL de busca agrega toda a região metropolitana (evidência real:
+    # anúncios de Vila Velha, Serra, Cariacica e Anchieta aparecem, não só
+    # de Vitória) — não há confirmação de um parâmetro de filtro por
+    # município/bairro para restringir isso no lado do servidor. Em vez de
+    # arriscar outro parâmetro não confirmado, aumenta-se o volume de cards
+    # inspecionados varrendo mais páginas (parâmetro de paginação "o",
+    # convenção conhecida da OLX Brasil), e o filtro estrito dos 5 bairros
+    # monitorados (_extrair_bairro) já faz o resto do trabalho.
+    PAGINAS_MAX = 3
+
     def extrair_recentes(self) -> list[dict]:
-        html = self._buscar_html_com_fallback_playwright(
-            self.BASE_URL, self.PARAMS, self.SELECTOR_ESPERA
-        )
-        if html is None:
-            return []
+        candidatos_totais: list[dict] = []
 
-        dados_json = self._extrair_json_embutido(html)
-        if dados_json is not None:
-            anuncios = self._localizar_lista_anuncios(dados_json)
-            candidatos = [
-                item
-                for anuncio in anuncios
-                if (item := self._normalizar_anuncio(anuncio)) is not None
-            ]
-        else:
-            logger.warning(
-                "json_embutido_nao_encontrado portal=%s "
-                "tentando_fallback=extracao_de_cards_html",
-                self.portal,
+        for pagina in range(1, self.PAGINAS_MAX + 1):
+            params = dict(self.PARAMS)
+            if pagina > 1:
+                params["o"] = str(pagina)  # CONFIRMAR: nome do parâmetro de paginação
+
+            html = self._buscar_html_com_fallback_playwright(
+                self.BASE_URL, params, self.SELECTOR_ESPERA
             )
-            candidatos = self._extrair_cards_html(html)
+            if html is None:
+                logger.warning(
+                    "pagina_sem_html portal=%s pagina=%d", self.portal, pagina
+                )
+                continue
 
-        return self._filtrar_e_logar(candidatos)
+            dados_json = self._extrair_json_embutido(html)
+            if dados_json is not None:
+                anuncios = self._localizar_lista_anuncios(dados_json)
+                candidatos = [
+                    item
+                    for anuncio in anuncios
+                    if (item := self._normalizar_anuncio(anuncio)) is not None
+                ]
+            else:
+                logger.warning(
+                    "json_embutido_nao_encontrado portal=%s pagina=%d "
+                    "tentando_fallback=extracao_de_cards_html",
+                    self.portal, pagina,
+                )
+                candidatos = self._extrair_cards_html(html)
+
+            logger.info(
+                "pagina_processada portal=%s pagina=%d candidatos=%d",
+                self.portal, pagina, len(candidatos),
+            )
+            candidatos_totais.extend(candidatos)
+
+        return self._filtrar_e_logar(candidatos_totais)
 
     @staticmethod
     def _extrair_json_embutido(html: str) -> dict | None:
@@ -824,18 +850,27 @@ class ZapVivaRealScraper(BaseScraper):
 
     portal = "zap_vivareal"
     BASE_URL = "https://www.vivareal.com.br/venda/espirito-santo/vitoria/apartamento_residencial/"
-    # CONFIRMAR: "preco-ate" era o nome assumido anteriormente; a execução
-    # real em produção mostrou que ele é ignorado pelo servidor (todos os
-    # cards retornados tinham preço acima do limite, mesmo com esse
-    # parâmetro na URL) — trocado para "price-max", nome de parâmetro
-    # usado em versões mais recentes do frontend do Grupo ZAP/VivaReal.
-    # Ainda não confirmado contra uma resposta real; validar no próximo
-    # run se os cards passam a vir dentro do limite de preço.
+    # CONFIRMAR: tanto "preco-ate" quanto "price-max" já foram testados
+    # como nome do parâmetro de preço, e nas duas execuções reais o
+    # servidor ignorou o filtro (cards retornados sempre acima do limite,
+    # mesmo com o parâmetro na URL) — indício de que a listagem pública do
+    # VivaReal não filtra por preço via query string na rota raiz. Por
+    # isso o filtro de preço NÃO é mais uma garantia esperada do lado do
+    # servidor: é só um hint best-effort mantido na URL, e a garantia real
+    # continua sendo inteiramente client-side, em
+    # _aplicar_criterios_obrigatorios (preco > PRECO_MAXIMO é descartado
+    # de qualquer forma, confirmado funcionando nos logs reais).
     PARAMS = {
         "quartos": "3",
-        "price-max": "750000",
+        "preco-ate": "750000",
         "ordem": "data-decrescente",  # CONFIRMAR: nome exato do parâmetro de ordenação por mais recentes
     }
+    # Como o servidor não filtra por preço, aumenta-se o volume de cards
+    # inspecionados por execução (varrendo mais páginas) para chegar aos
+    # imóveis mais baratos, que tendem a ficar afastados do topo de uma
+    # busca ordenada só por "mais recentes". Nome do parâmetro de página
+    # marcado CONFIRMAR: não verificado contra uma resposta real ainda.
+    PAGINAS_MAX = 2
     # Fragmento (#) da URL original fornecida. Fragmentos não são enviados
     # ao servidor em uma requisição HTTP comum (só são interpretados pelo
     # navegador) — por isso não têm efeito no caminho via `requests`. É
@@ -846,14 +881,30 @@ class ZapVivaRealScraper(BaseScraper):
     URL_FRAGMENTO = "#preco-ate=750000"
 
     def extrair_recentes(self) -> list[dict]:
-        html = self._buscar_html_com_fallback_playwright(
-            self.BASE_URL, self.PARAMS, fragmento=self.URL_FRAGMENTO
-        )
-        if html is None:
-            return []
+        candidatos_totais: list[dict] = []
 
-        candidatos = self._extrair_cards_html(html)
-        return self._filtrar_e_logar(candidatos)
+        for pagina in range(1, self.PAGINAS_MAX + 1):
+            params = dict(self.PARAMS)
+            if pagina > 1:
+                params["pagina"] = str(pagina)  # CONFIRMAR: nome do parâmetro de paginação
+
+            html = self._buscar_html_com_fallback_playwright(
+                self.BASE_URL, params, fragmento=self.URL_FRAGMENTO
+            )
+            if html is None:
+                logger.warning(
+                    "pagina_sem_html portal=%s pagina=%d", self.portal, pagina
+                )
+                continue
+
+            candidatos = self._extrair_cards_html(html)
+            logger.info(
+                "pagina_processada portal=%s pagina=%d candidatos=%d",
+                self.portal, pagina, len(candidatos),
+            )
+            candidatos_totais.extend(candidatos)
+
+        return self._filtrar_e_logar(candidatos_totais)
 
     def _extrair_cards_html(self, html: str) -> list[dict]:
         """CONFIRMAR: seletor de cards não pôde ser validado contra o site

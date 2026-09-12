@@ -43,19 +43,15 @@ from scrapers.portais import validar_presenca_elevador
 logger = logging.getLogger(__name__)
 
 # Termos mandatórios para quantidade de quartos (Regra: exatamente esta
-# cláusula OR deve constar na busca). Ampliado para cobrir variações
-# léxicas comuns em anúncios classificados (abreviações e sinônimos),
-# além da forma completa.
-TERMOS_QUARTOS = [
-    "3 quartos", "3 dormitórios", "3 dorms", "3 qts", "3Q", "tres quartos",
-]
+# cláusula OR deve constar na busca). Reduzido de 6 para 3 termos: a
+# execução real mostrou HTTP 202 (provável mitigação anti-bot do endpoint
+# HTML do DuckDuckGo) após ampliar a query para muitas cláusulas OR
+# agrupadas; simplificar reduz o número de operadores booleanos na busca.
+TERMOS_QUARTOS = ["3 quartos", "3 dormitórios", "3 qts"]
 
-# Termos de oportunidade específicos para esta busca. É um subconjunto
-# curado de config.TERMOS_OPORTUNIDADE (que também inclui "partilha" e
-# "motivo de mudança"), acrescido de "oportunidade" e "desocupado".
-TERMOS_OPORTUNIDADE_DORK = [
-    "reforma", "original", "inventário", "oportunidade", "urgente", "desocupado",
-]
+# Termos de oportunidade específicos para esta busca, também reduzidos
+# para simplificar a query pelo mesmo motivo.
+TERMOS_OPORTUNIDADE_DORK = ["reforma", "urgente", "oportunidade"]
 
 BAIRROS_PRIORITARIOS = list(BENCHMARKS_M2.keys())
 
@@ -67,22 +63,22 @@ def _clausula_or(termos: list[str]) -> str:
 
 
 def montar_query() -> str:
-    """Monta a query de busca combinando, em cláusulas AND: quartos (OR),
-    segmentação geográfica (Vitória + bairros prioritários, OR) e termos de
-    oportunidade (OR).
+    """Monta a query de busca combinando, em cláusulas AND: segmentação
+    geográfica (Vitória + bairros prioritários, OR), quartos (OR) e termos
+    de oportunidade (OR).
 
     O termo "elevador" foi removido da query (era um AND literal obrigatório
-    junto aos demais). Com EXIGIR_ELEVADOR=False, elevador não é mais
-    critério eliminatório em nenhum outro scraper deste projeto — mantê-lo
-    como cláusula AND aqui era inconsistente com essa decisão e, em uma
-    query já combinando 3 cláusulas OR distintas, reduz ainda mais a chance
-    de casar com qualquer resultado real do motor de busca."""
+    junto aos demais, inconsistente com EXIGIR_ELEVADOR=False). Query
+    simplificada (3 cláusulas OR de 3 termos cada, no lugar de conjuntos
+    maiores) após uma execução real retornar HTTP 202 do endpoint HTML do
+    DuckDuckGo, provável mitigação anti-bot sensível ao número de
+    operadores booleanos agrupados na busca."""
     clausula_quartos = _clausula_or(TERMOS_QUARTOS)
     clausula_bairros = _clausula_or(BAIRROS_PRIORITARIOS)
     clausula_oportunidade = _clausula_or(TERMOS_OPORTUNIDADE_DORK)
 
     return (
-        f"{clausula_quartos} Vitória {clausula_bairros} "
+        f"Vitória {clausula_quartos} {clausula_bairros} "
         f"{clausula_oportunidade}"
     )
 
