@@ -17,13 +17,20 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta, timezone
 
 import requests
 from bs4 import BeautifulSoup
 
-from config import JANELA_MAX_HORAS
+from config import (
+    EXIGIR_ELEVADOR,
+    JANELA_MAX_HORAS,
+    PRECO_MAXIMO,
+    QUARTOS_MINIMO,
+    REGEX_ELEVADOR,
+)
 from database import ja_processado
 
 logger = logging.getLogger(__name__)
@@ -35,6 +42,21 @@ HEADERS = {
     )
 }
 
+# Termos que indicam ausência explícita de elevador. Diferente de
+# config.REGEX_ELEVADOR (que identifica a presença), isto é um detalhe de
+# interpretação de texto usado apenas na extração, para que uma descrição
+# como "sem elevador" não seja tratada como comprovação de presença.
+TERMOS_SEM_ELEVADOR = [
+    "sem elevador",
+    "não possui elevador",
+    "não tem elevador",
+    "não há elevador",
+]
+REGEX_SEM_ELEVADOR = re.compile(
+    "|".join(re.escape(termo) for termo in TERMOS_SEM_ELEVADOR),
+    re.IGNORECASE,
+)
+
 
 class BaseScraper(ABC):
     """Interface padrão para os extratores de portais imobiliários."""
@@ -44,6 +66,7 @@ class BaseScraper(ABC):
     @abstractmethod
     def extrair_recentes(self) -> list[dict]:
         """Retorna anúncios recentes: dentro da janela de tempo válida,
+        atendendo aos critérios obrigatórios de preço/quartos/elevador,
         ainda não presentes no database.py e normalizados para o schema
         de imoveis_processados."""
         raise NotImplementedError
@@ -91,6 +114,76 @@ class BaseScraper(ABC):
 
         return validos
 
+    def _aplicar_criterios_obrigatorios(
+        self, item: dict, atributos_estruturados: list | None, texto_completo: str
+    ) -> bool:
+        """Filtro de descarte imediato: preço máximo, quartos mínimo e
+        comprovação estrita de elevador, aplicado antes de repassar o item
+        ao motor de análise. Retorna False (com log estruturado do motivo)
+        se qualquer critério obrigatório não for atendido ou não puder ser
+        comprovado a partir dos dados extraídos."""
+        id_origem = item.get("id_origem")
+        preco = item.get("preco")
+        quartos = item.get("quartos")
+
+        if preco is None:
+            logger.info(
+                "descartado motivo=preco_desconhecido portal=%s id_origem=%s",
+                self.portal, id_origem,
+            )
+            return False
+
+        if preco > PRECO_MAXIMO:
+            logger.info(
+                "descartado motivo=preco_acima_do_maximo portal=%s id_origem=%s "
+                "preco=%s limite=%s",
+                self.portal, id_origem, preco, PRECO_MAXIMO,
+            )
+            return False
+
+        if quartos is None:
+            logger.info(
+                "descartado motivo=quartos_desconhecido portal=%s id_origem=%s",
+                self.portal, id_origem,
+            )
+            return False
+
+        if quartos < QUARTOS_MINIMO:
+            logger.info(
+                "descartado motivo=quartos_insuficiente portal=%s id_origem=%s "
+                "quartos=%s minimo=%s",
+                self.portal, id_origem, quartos, QUARTOS_MINIMO,
+            )
+            return False
+
+        if EXIGIR_ELEVADOR and not self._possui_elevador(atributos_estruturados, texto_completo):
+            logger.info(
+                "descartado motivo=elevador_nao_comprovado portal=%s id_origem=%s",
+                self.portal, id_origem,
+            )
+            return False
+
+        return True
+
+    @staticmethod
+    def _possui_elevador(atributos_estruturados: list | None, texto: str) -> bool:
+        """Comprova a presença de elevador de forma estrita: ausência
+        explícita no texto ("sem elevador") descarta imediatamente; na
+        falta de qualquer evidência positiva (atributo estruturado ou termo
+        no título/descrição), também descarta — a presença nunca é
+        presumida por omissão."""
+        texto = texto or ""
+
+        if REGEX_SEM_ELEVADOR.search(texto):
+            return False
+
+        for atributo in atributos_estruturados or []:
+            valor = str(atributo).strip().lower()
+            if valor in ("elevador", "elevator") or "elevador" in valor:
+                return True
+
+        return bool(REGEX_ELEVADOR.search(texto))
+
     @staticmethod
     def _parse_data_iso(valor) -> datetime | None:
         if not valor:
@@ -100,20 +193,43 @@ class BaseScraper(ABC):
         except ValueError:
             return None
 
+    @staticmethod
+    def _to_float_or_none(valor) -> float | None:
+        if valor is None:
+            return None
+        try:
+            return float(valor)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _to_int_or_none(valor) -> int | None:
+        if valor is None:
+            return None
+        try:
+            return int(valor)
+        except (TypeError, ValueError):
+            return None
+
 
 class OLXScraper(BaseScraper):
     """Extrator de anúncios de apartamentos e casas em Vitória-ES na OLX.
 
     A ordenação por "mais recentes" e a extração via JSON embutido
     (`__NEXT_DATA__`) seguem o padrão publicamente documentado de páginas
-    Next.js da OLX. O valor do parâmetro `sf` e o caminho `props.pageProps`
+    Next.js da OLX. O valor do parâmetro `sf`, os parâmetros de preço
+    máximo (`pe`) e quartos mínimo (`ros`), e o caminho `props.pageProps`
     estão marcados como CONFIRMAR: não puderam ser validados neste ambiente
     por bloqueio de egress a olx.com.br.
     """
 
     portal = "olx"
     BASE_URL = "https://www.olx.com.br/imoveis/venda/estado-es/grande-vitoria/vitoria"
-    PARAMS = {"sf": "1"}  # CONFIRMAR: parâmetro de ordenação "mais recentes"
+    PARAMS = {
+        "sf": "1",  # CONFIRMAR: ordenação por "mais recentes"
+        "pe": "750000",  # CONFIRMAR: "preço até" (preço máximo)
+        "ros": "3",  # CONFIRMAR: quartos mínimo
+    }
 
     def extrair_recentes(self) -> list[dict]:
         try:
@@ -159,10 +275,16 @@ class OLXScraper(BaseScraper):
         try:
             id_origem = f"olx-{anuncio['listId']}"
             data_publicacao = self._parse_data_iso(anuncio.get("date"))
-            preco = float(anuncio.get("price", 0) or 0)
-            area_m2 = float(anuncio.get("properties", {}).get("size", 0) or 0)
+            propriedades = anuncio.get("properties", {}) or {}
+            preco = self._to_float_or_none(anuncio.get("price"))
+            area_m2 = self._to_float_or_none(propriedades.get("size")) or 0.0
+            # CONFIRMAR: chave de quartos e de comodidades estruturadas.
+            quartos = self._to_int_or_none(propriedades.get("rooms"))
+            atributos_estruturados = propriedades.get("amenities") or []
             bairro = anuncio.get("locationDetails", {}).get("neighbourhood", "")
             url = anuncio.get("url", "")
+            titulo = anuncio.get("title", "")
+            descricao = anuncio.get("description", "")
         except (KeyError, TypeError, ValueError) as exc:
             logger.warning("descartado motivo=erro_parse portal=%s erro=%s", self.portal, exc)
             return None
@@ -170,21 +292,28 @@ class OLXScraper(BaseScraper):
         if data_publicacao is None:
             return None
 
-        preco_m2 = round(preco / area_m2, 2) if area_m2 else None
+        preco_m2 = round(preco / area_m2, 2) if preco and area_m2 else None
 
-        return {
+        item = {
             "id_origem": id_origem,
             "portal": self.portal,
-            "titulo": anuncio.get("title", ""),
+            "titulo": titulo,
             "preco": preco,
             "area_m2": area_m2,
             "preco_m2": preco_m2,
+            "quartos": quartos,
             "bairro": bairro,
             "url": url,
-            "descricao": anuncio.get("description", ""),
+            "descricao": descricao,
             "data_criacao_anuncio": data_publicacao.isoformat(),
             "data_criacao_anuncio_dt": data_publicacao,
         }
+
+        texto_completo = f"{titulo} {descricao}"
+        if not self._aplicar_criterios_obrigatorios(item, atributos_estruturados, texto_completo):
+            return None
+
+        return item
 
 
 class ZapVivaRealScraper(BaseScraper):
@@ -192,10 +321,11 @@ class ZapVivaRealScraper(BaseScraper):
 
     O endpoint `glue-api.vivareal.com/v2/listings` é o utilizado publicamente
     pelo próprio site (VivaReal e ZAP Imóveis compartilham a mesma origem de
-    dados) para popular resultados de busca via XHR. Os nomes de parâmetros e
-    o caminho dos campos na resposta estão marcados como CONFIRMAR: não
-    puderam ser validados neste ambiente por bloqueio de egress a
-    vivareal.com.br/zapimoveis.com.br.
+    dados) para popular resultados de busca via XHR. Os nomes de parâmetros
+    (incluindo `maxPrice`/`minBedrooms`, equivalentes a `max_price`/
+    `min_rooms`) e o caminho dos campos na resposta estão marcados como
+    CONFIRMAR: não puderam ser validados neste ambiente por bloqueio de
+    egress a vivareal.com.br/zapimoveis.com.br.
     """
 
     portal = "zap_vivareal"
@@ -207,6 +337,8 @@ class ZapVivaRealScraper(BaseScraper):
         "addressState": "Espírito Santo",
         "addressCountry": "Brasil",
         "sort": "most_recent",  # CONFIRMAR: valor exato do parâmetro de ordenação
+        "maxPrice": "750000",  # CONFIRMAR: equivalente a max_price
+        "minBedrooms": "3",  # CONFIRMAR: equivalente a min_rooms
         "size": "50",
         "from": "0",
     }
@@ -242,11 +374,18 @@ class ZapVivaRealScraper(BaseScraper):
             data_publicacao = self._parse_data_iso(
                 listagem.get("updatedAt") or listagem.get("createdAt")
             )
-            preco = float((listagem.get("pricingInfos") or [{}])[0].get("price", 0) or 0)
-            area_m2 = float((listagem.get("usableAreas") or [0])[0] or 0)
+            preco = self._to_float_or_none(
+                (listagem.get("pricingInfos") or [{}])[0].get("price")
+            )
+            area_m2 = self._to_float_or_none((listagem.get("usableAreas") or [None])[0]) or 0.0
+            # CONFIRMAR: chave de quartos e de comodidades estruturadas.
+            quartos = self._to_int_or_none((listagem.get("bedrooms") or [None])[0])
+            atributos_estruturados = listagem.get("amenities") or []
             endereco = listagem.get("address", {})
             bairro = endereco.get("neighborhood", "")
             url = f"https://www.vivareal.com.br/imovel/{listagem['id']}/"
+            titulo = listagem.get("title", "")
+            descricao = listagem.get("description", "")
         except (KeyError, IndexError, TypeError, ValueError) as exc:
             logger.warning("descartado motivo=erro_parse portal=%s erro=%s", self.portal, exc)
             return None
@@ -254,18 +393,25 @@ class ZapVivaRealScraper(BaseScraper):
         if data_publicacao is None:
             return None
 
-        preco_m2 = round(preco / area_m2, 2) if area_m2 else None
+        preco_m2 = round(preco / area_m2, 2) if preco and area_m2 else None
 
-        return {
+        item = {
             "id_origem": id_origem,
             "portal": self.portal,
-            "titulo": listagem.get("title", ""),
+            "titulo": titulo,
             "preco": preco,
             "area_m2": area_m2,
             "preco_m2": preco_m2,
+            "quartos": quartos,
             "bairro": bairro,
             "url": url,
-            "descricao": listagem.get("description", ""),
+            "descricao": descricao,
             "data_criacao_anuncio": data_publicacao.isoformat(),
             "data_criacao_anuncio_dt": data_publicacao,
         }
+
+        texto_completo = f"{titulo} {descricao}"
+        if not self._aplicar_criterios_obrigatorios(item, atributos_estruturados, texto_completo):
+            return None
+
+        return item
