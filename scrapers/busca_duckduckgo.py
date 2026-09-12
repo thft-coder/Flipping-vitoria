@@ -63,14 +63,21 @@ def _clausula_or(termos: list[str]) -> str:
 
 def montar_query() -> str:
     """Monta a query de busca combinando, em cláusulas AND: quartos (OR),
-    elevador, segmentação geográfica (Vitória + bairros prioritários, OR)
-    e termos de oportunidade (OR)."""
+    segmentação geográfica (Vitória + bairros prioritários, OR) e termos de
+    oportunidade (OR).
+
+    O termo "elevador" foi removido da query (era um AND literal obrigatório
+    junto aos demais). Com EXIGIR_ELEVADOR=False, elevador não é mais
+    critério eliminatório em nenhum outro scraper deste projeto — mantê-lo
+    como cláusula AND aqui era inconsistente com essa decisão e, em uma
+    query já combinando 3 cláusulas OR distintas, reduz ainda mais a chance
+    de casar com qualquer resultado real do motor de busca."""
     clausula_quartos = _clausula_or(TERMOS_QUARTOS)
     clausula_bairros = _clausula_or(BAIRROS_PRIORITARIOS)
     clausula_oportunidade = _clausula_or(TERMOS_OPORTUNIDADE_DORK)
 
     return (
-        f"{clausula_quartos} elevador Vitória {clausula_bairros} "
+        f"{clausula_quartos} Vitória {clausula_bairros} "
         f"{clausula_oportunidade}"
     )
 
