@@ -88,8 +88,12 @@ def enviar_alerta_telegram(imovel: dict) -> bool:
     url = TELEGRAM_API_URL.format(token=TELEGRAM_BOT_TOKEN)
 
     try:
+        # NÃO usar raise_for_status(): em erro (4xx/5xx) a API do Telegram
+        # ainda retorna um corpo JSON com "description" explicando a causa
+        # exata (ex.: "can't parse entities", "chat not found", "bot was
+        # blocked"). raise_for_status() dispararia a exceção antes desse
+        # corpo ser lido, descartando o diagnóstico real.
         resposta = requests.post(url, json=payload, timeout=15)
-        resposta.raise_for_status()
         corpo = resposta.json()
     except (requests.RequestException, ValueError) as exc:
         logger.error(
@@ -99,8 +103,8 @@ def enviar_alerta_telegram(imovel: dict) -> bool:
 
     if not corpo.get("ok"):
         logger.error(
-            "falha_envio_telegram id_origem=%s resposta=%s",
-            imovel.get("id_origem"), corpo,
+            "falha_envio_telegram id_origem=%s status_http=%s resposta=%s",
+            imovel.get("id_origem"), resposta.status_code, corpo,
         )
         return False
 
