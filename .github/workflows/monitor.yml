@@ -39,6 +39,19 @@ jobs:
           GOOGLE_CSE_ID: ${{ secrets.GOOGLE_CSE_ID }}
         run: python main.py
 
+      # Diagnóstico: só existe arquivo se scrapers/portais.py detectou
+      # bloqueio/seletor não encontrado e salvou o HTML real recebido
+      # (debug_<portal>_html.html). Permite inspecionar a estrutura real
+      # da página sem precisar reproduzir o bloqueio manualmente.
+      - name: Upload do HTML de diagnóstico (se capturado)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-html
+          path: debug_*_html.html
+          if-no-files-found: ignore
+          retention-days: 5
+
       - name: Persistir banco de dados (commit e push)
         run: |
           git config user.name "github-actions[bot]"

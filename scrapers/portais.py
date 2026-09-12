@@ -276,6 +276,19 @@ class BaseScraper(ABC):
                 return marcador
         return None
 
+    def _salvar_html_diagnostico(self, html: str) -> None:
+        """Salva o HTML recebido em disco (debug_<portal>_html.html) para
+        inspeção posterior via artifact do GitHub Actions — usado só quando
+        a extração normal falha, para permitir diagnosticar a estrutura
+        real da página em vez de seguir supondo seletores às cegas."""
+        caminho = f"debug_{self.portal}_html.html"
+        try:
+            with open(caminho, "w", encoding="utf-8") as arquivo:
+                arquivo.write(html)
+            logger.info("html_diagnostico_salvo portal=%s caminho=%s", self.portal, caminho)
+        except OSError as exc:
+            logger.warning("falha_salvar_html_diagnostico portal=%s erro=%s", self.portal, exc)
+
     def _buscar_html_via_playwright(self, url: str, selector_espera: str | None = None) -> str | None:
         """Renderiza a página com Chromium headless (Playwright) para
         contornar bloqueios 403 baseados em verificação de navegador real
@@ -358,12 +371,14 @@ class BaseScraper(ABC):
                     "html_tamanho=%d html_inicio=%r",
                     self.portal, marcador_bloqueio, len(html), html[:500],
                 )
+                self._salvar_html_diagnostico(html)
             elif selector_espera and not seletor_encontrado:
                 logger.warning(
                     "seletor_nao_encontrado_apos_espera portal=%s seletor=%r "
                     "html_tamanho=%d html_inicio=%r",
                     self.portal, selector_espera, len(html), html[:500],
                 )
+                self._salvar_html_diagnostico(html)
 
             return html
         except Exception as exc:
