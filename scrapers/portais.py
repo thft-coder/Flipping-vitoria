@@ -66,6 +66,12 @@ HEADERS_NAVEGADOR = {
 # sem estar em um contexto de negação (já tratado pela Regra 2).
 REGEX_ELEVADOR_ISOLADO = re.compile(r"\belevador(es)?\b", re.IGNORECASE)
 
+# Quartos: além da forma completa "quartos", cobre variações léxicas comuns
+# em anúncios classificados (abreviações e sinônimos regionais).
+REGEX_QUARTOS = re.compile(
+    r"(\d+)\s*(?:quartos?|dormit[óo]rios?|dorms?|qts?|q)\b", re.IGNORECASE
+)
+
 
 def validar_presenca_elevador(anuncio: dict) -> bool:
     """Valida a presença de elevador a partir de atributos estruturados e do
@@ -223,14 +229,26 @@ class BaseScraper(ABC):
         return item
 
     def _buscar_html_com_fallback_playwright(
-        self, url: str, params: dict, selector_espera: str | None = None
+        self,
+        url: str,
+        params: dict,
+        selector_espera: str | None = None,
+        fragmento: str = "",
     ) -> str | None:
         """Busca uma página via requests com headers de navegador; em caso
         de bloqueio HTTP 403 (anti-bot), recorre ao Playwright headless
         para renderizar a página com um navegador real. `selector_espera`
         (opcional) é um seletor CSS aguardado explicitamente após o
         carregamento, para dar tempo à hidratação de conteúdo React antes
-        de capturar o HTML final (ver `_buscar_html_via_playwright`)."""
+        de capturar o HTML final (ver `_buscar_html_via_playwright`).
+
+        `fragmento` (opcional, ex.: "#preco-ate=750000") só é aplicado no
+        caminho do Playwright: um fragmento de URL nunca é enviado ao
+        servidor em uma requisição HTTP (é interpretado só no navegador),
+        então incluí-lo na chamada via `requests` seria inócuo; só faz
+        sentido quando uma página SPA lê `location.hash` via JavaScript do
+        lado do cliente para aplicar um filtro, o que só ocorre quando a
+        página é de fato renderizada em um navegador real."""
         try:
             resposta = requests.get(url, params=params, headers=HEADERS_NAVEGADOR, timeout=15)
         except requests.RequestException as exc:
@@ -244,6 +262,8 @@ class BaseScraper(ABC):
                 self.portal,
             )
             url_completa = f"{url}?{urlencode(params)}" if params else url
+            if fragmento:
+                url_completa = f"{url_completa}{fragmento}"
             return self._buscar_html_via_playwright(url_completa, selector_espera)
 
         try:
@@ -479,10 +499,15 @@ class BaseScraper(ABC):
         area_match = re.search(r"(\d+)\s*m²", texto_card)
         area_m2 = self._to_float_or_none(area_match.group(1)) if area_match else 0.0
 
-        quartos_match = re.search(r"(\d+)\s*quartos?\b", texto_card, re.IGNORECASE)
+        quartos_match = REGEX_QUARTOS.search(texto_card)
         quartos = self._to_int_or_none(quartos_match.group(1)) if quartos_match else None
 
-        bairro = next((b for b in BENCHMARKS_M2 if b.lower() in texto_card.lower()), "")
+        bairro = self._extrair_bairro(texto_card, href)
+        if not bairro:
+            logger.info(
+                "bairro_nao_encontrado_no_card portal=%s url=%s amostra_texto=%r",
+                self.portal, href, texto_card[:300],
+            )
 
         preco_m2 = round(preco / area_m2, 2) if preco and area_m2 else None
 
@@ -553,6 +578,30 @@ class BaseScraper(ABC):
             return int(valor)
         except (TypeError, ValueError):
             return None
+
+    @staticmethod
+    def _extrair_bairro(texto_card: str, href: str = "") -> str:
+        """Localiza o bairro por substring contra a lista oficial de bairros
+        monitorados (config.BENCHMARKS_M2), primeiro no texto completo do
+        card (título + demais nós de texto capturados pelo container do
+        card, incluindo eventuais nós de localização). Se não encontrar
+        (ex.: o nome do bairro aparece só em um nó de localização fora do
+        alcance do container identificado, ou o card não expõe essa
+        informação como texto visível), tenta o slug do próprio link do
+        anúncio (href) como fallback semântico adicional: classificados
+        costumam embutir o bairro no slug legível da URL
+        (ex.: "apto-3-quartos-jardim-da-penha-1234567890"), e usar o href
+        não corre o risco de "vazar" texto de outros cards vizinhos (ao
+        contrário de simplesmente alargar o container HTML pesquisado)."""
+        bairro = next((b for b in BENCHMARKS_M2 if b.lower() in texto_card.lower()), "")
+        if bairro:
+            return bairro
+
+        if href:
+            texto_href = href.replace("-", " ").replace("/", " ").replace("_", " ")
+            bairro = next((b for b in BENCHMARKS_M2 if b.lower() in texto_href.lower()), "")
+
+        return bairro
 
     # Tags candidatas a "card completo" de um anúncio, na varredura de
     # ancestrais do link (ver _localizar_container_do_card).
@@ -775,20 +824,31 @@ class ZapVivaRealScraper(BaseScraper):
 
     portal = "zap_vivareal"
     BASE_URL = "https://www.vivareal.com.br/venda/espirito-santo/vitoria/apartamento_residencial/"
+    # CONFIRMAR: "preco-ate" era o nome assumido anteriormente; a execução
+    # real em produção mostrou que ele é ignorado pelo servidor (todos os
+    # cards retornados tinham preço acima do limite, mesmo com esse
+    # parâmetro na URL) — trocado para "price-max", nome de parâmetro
+    # usado em versões mais recentes do frontend do Grupo ZAP/VivaReal.
+    # Ainda não confirmado contra uma resposta real; validar no próximo
+    # run se os cards passam a vir dentro do limite de preço.
     PARAMS = {
         "quartos": "3",
-        "preco-ate": "750000",
+        "price-max": "750000",
         "ordem": "data-decrescente",  # CONFIRMAR: nome exato do parâmetro de ordenação por mais recentes
     }
-    # A URL fornecida também incluía um fragmento "#onde=...": fragmentos
-    # (#) são interpretados só no navegador (client-side, ex.: para
-    # pré-preencher o mapa) e nunca são enviados ao servidor em uma
-    # requisição HTTP — por isso foram omitidos aqui, já que não têm efeito
-    # sobre a página retornada por requests.get nem pelo Playwright em modo
-    # de navegação simples.
+    # Fragmento (#) da URL original fornecida. Fragmentos não são enviados
+    # ao servidor em uma requisição HTTP comum (só são interpretados pelo
+    # navegador) — por isso não têm efeito no caminho via `requests`. É
+    # incluído aqui só para o fallback via Playwright (ver `fragmento` em
+    # `_buscar_html_com_fallback_playwright`), caso a SPA leia
+    # `location.hash` do lado do cliente para aplicar esse filtro; não há
+    # confirmação de que isso realmente ocorra.
+    URL_FRAGMENTO = "#preco-ate=750000"
 
     def extrair_recentes(self) -> list[dict]:
-        html = self._buscar_html_com_fallback_playwright(self.BASE_URL, self.PARAMS)
+        html = self._buscar_html_com_fallback_playwright(
+            self.BASE_URL, self.PARAMS, fragmento=self.URL_FRAGMENTO
+        )
         if html is None:
             return []
 
