@@ -965,3 +965,224 @@ class ZapVivaRealScraper(BaseScraper):
                 candidatos.append(item_finalizado)
 
         return candidatos
+
+
+class ImovelWebScraper(BaseScraper):
+    """Extrator da página pública de busca do ImovelWeb.
+
+    FUNDAMENTAÇÃO: o diagnóstico do canal DuckDuckGo (que buscava
+    "apartamento 3 quartos venda vitoria") mostrou que a maioria dos
+    resultados retornados eram páginas de categoria/agregador de vários
+    portais, não anúncios individuais com preço extraível — o motor de
+    busca prefere indexar essas páginas por SEO, então nenhum ajuste de
+    query resolveria isso. A URL do ImovelWeb apareceu real nesses
+    resultados (`imovelweb.com.br/apartamentos-venda-vitoria-es-3-quartos.
+    html`, "1.427 Apartamentos... Apartamento À venda | bento ferreira -
+    vitória/es 196m²...") com um card de anúncio individual visível no
+    snippet, o que sugere que a PRÓPRIA página de busca do ImovelWeb tem
+    cards estruturados com preço — o mesmo padrão que já funciona bem
+    para OLX e ZAP/VivaReal, só que fazendo scraping direto da página de
+    busca do portal em vez de depender do motor de busca externo achá-la.
+
+    CONFIRMAR (não validado contra uma resposta real ainda): o seletor de
+    cards, o padrão de paginação (`-pagina-N.html`, suposto por convenção
+    comum em sites .html paginados, nunca confirmado) e se a página é
+    servida via SSR direto ou exige JS para carregar os cards (o fallback
+    Playwright cobre esse segundo caso). Preço, quartos, área e bairro
+    continuam garantidos do nosso lado, como em todos os outros scrapers.
+    """
+
+    portal = "imovelweb"
+    BASE_URL = "https://www.imovelweb.com.br/apartamentos-venda-vitoria-es-3-quartos.html"
+    PAGINAS_MAX = 3
+
+    # CONFIRMAR: seletor de espera para o fallback Playwright. Sem
+    # confirmação da estrutura real, espera só pelo carregamento básico
+    # do body — o diagnóstico estrutural (_salvar_html_diagnostico) é
+    # acionado explicitamente abaixo se nenhum card for encontrado.
+    SELECTOR_ESPERA = "body"
+
+    # Heurística igual à já usada para OLX: URLs de anúncio de portais
+    # brasileiros de imóveis tipicamente terminam em ID numérico longo
+    # antes da extensão/barra final.
+    _REGEX_LINK_ANUNCIO = re.compile(r"-\d{6,}(?:\.html)?/?(?:\?.*)?$")
+
+    def extrair_recentes(self) -> list[dict]:
+        candidatos_totais: list[dict] = []
+
+        for pagina in range(1, self.PAGINAS_MAX + 1):
+            url = self.BASE_URL
+            if pagina > 1:
+                # CONFIRMAR: convenção de paginação assumida, não validada.
+                url = url.replace(".html", f"-pagina-{pagina}.html")
+
+            html = self._buscar_html_com_fallback_playwright(url, {}, self.SELECTOR_ESPERA)
+            if html is None:
+                logger.warning(
+                    "pagina_sem_html portal=%s pagina=%d", self.portal, pagina
+                )
+                continue
+
+            candidatos = self._extrair_cards_html(html)
+            if not candidatos:
+                # Sem nenhum card encontrado: salva o HTML real e loga um
+                # resumo estrutural, para confirmar (ou corrigir) o
+                # seletor no próximo diagnóstico, em vez de continuar
+                # supondo às cegas.
+                logger.warning(
+                    "nenhum_card_encontrado portal=%s pagina=%d "
+                    "salvando_diagnostico=True",
+                    self.portal, pagina,
+                )
+                self._salvar_html_diagnostico(html)
+
+            logger.info(
+                "pagina_processada portal=%s pagina=%d candidatos=%d",
+                self.portal, pagina, len(candidatos),
+            )
+            candidatos_totais.extend(candidatos)
+
+        return self._filtrar_e_logar(candidatos_totais)
+
+    def _extrair_cards_html(self, html: str) -> list[dict]:
+        soup = BeautifulSoup(html, "html.parser")
+        candidatos = []
+        vistos = set()
+
+        for link in soup.find_all("a", href=True):
+            href = link.get("href", "")
+            if not href or not self._REGEX_LINK_ANUNCIO.search(href) or href in vistos:
+                continue
+            vistos.add(href)
+
+            card = self._localizar_container_do_card(link)
+            texto_card = card.get_text(" ", strip=True)
+
+            url = href if href.startswith("http") else f"https://www.imovelweb.com.br{href}"
+            match_id = re.search(r"-(\d+)(?:\.html)?/?$", href.rstrip("/"))
+            id_origem = (
+                f"imovelweb-{match_id.group(1)}" if match_id
+                else f"imovelweb-{hashlib.sha1(href.encode('utf-8')).hexdigest()[:16]}"
+            )
+
+            item = self._card_generico_para_item(
+                href, texto_card, url, id_origem, exigir_data_relativa=False
+            )
+            if item is None:
+                continue
+
+            item_finalizado = self._finalizar_item(item)
+            if item_finalizado is not None:
+                candidatos.append(item_finalizado)
+
+        return candidatos
+
+
+class ChavesNaMaoScraper(BaseScraper):
+    """Extrator da página pública de busca por bairro do ChavesNaMão.
+
+    FUNDAMENTAÇÃO: mesma motivação do ImovelWebScraper (ver docstring
+    acima) — o diagnóstico do DuckDuckGo mostrou a URL real
+    `chavesnamao.com.br/apartamentos-a-venda/es-vitoria/jardim-da-penha/
+    3-quartos/` ("176 Apartamentos com 3 quartos à venda no Jardim da
+    Penha"), já filtrada por bairro na própria URL — diferente do
+    ImovelWeb, aqui a busca por bairro do próprio site já é confirmada
+    (para Jardim da Penha), então replica-se o mesmo padrão de busca
+    direcionada por bairro já usado na OLX e no ZAP/VivaReal.
+
+    CONFIRMAR (não validado ainda): os slugs de bairro para os outros 4
+    bairros monitorados (extrapolados do padrão confirmado de Jardim da
+    Penha, kebab-case do nome oficial), o parâmetro de paginação
+    (`?pg=N`, suposto) e o seletor de cards.
+    """
+
+    portal = "chaves_na_mao"
+
+    # Mapeamento bairro (nome oficial, mesmo usado em config.BENCHMARKS_M2)
+    # -> slug usado na URL de busca por bairro. Só "jardim-da-penha" é
+    # confirmado contra uma URL real; os demais são extrapolação do
+    # mesmo padrão (kebab-case do nome oficial).
+    BAIRRO_SLUGS = {
+        "Jardim da Penha": "jardim-da-penha",
+        "Praia do Canto": "praia-do-canto",
+        "Mata da Praia": "mata-da-praia",
+        "Bento Ferreira": "bento-ferreira",
+        "Jardim Camburi": "jardim-camburi",
+    }
+
+    PAGINAS_POR_BAIRRO = 2
+    DELAY_ENTRE_BAIRROS_SEGUNDOS = 2
+    SELECTOR_ESPERA = "body"
+
+    _REGEX_LINK_ANUNCIO = re.compile(r"-\d{6,}/?(?:\?.*)?$")
+
+    def extrair_recentes(self) -> list[dict]:
+        candidatos_totais: list[dict] = []
+
+        bairros = list(self.BAIRRO_SLUGS.items())
+        for indice, (bairro, slug) in enumerate(bairros):
+            for pagina in range(1, self.PAGINAS_POR_BAIRRO + 1):
+                url = f"https://www.chavesnamao.com.br/apartamentos-a-venda/es-vitoria/{slug}/3-quartos/"
+                if pagina > 1:
+                    url += f"?pg={pagina}"  # CONFIRMAR: nome do parâmetro de paginação
+
+                html = self._buscar_html_com_fallback_playwright(url, {}, self.SELECTOR_ESPERA)
+                if html is None:
+                    logger.warning(
+                        "pagina_sem_html portal=%s bairro=%s pagina=%d",
+                        self.portal, bairro, pagina,
+                    )
+                    continue
+
+                candidatos = self._extrair_cards_html(html)
+                if not candidatos:
+                    logger.warning(
+                        "nenhum_card_encontrado portal=%s bairro=%s pagina=%d "
+                        "salvando_diagnostico=True",
+                        self.portal, bairro, pagina,
+                    )
+                    self._salvar_html_diagnostico(html)
+
+                logger.info(
+                    "pagina_processada portal=%s bairro=%s pagina=%d candidatos=%d",
+                    self.portal, bairro, pagina, len(candidatos),
+                )
+                candidatos_totais.extend(candidatos)
+
+            if indice < len(bairros) - 1:
+                time.sleep(self.DELAY_ENTRE_BAIRROS_SEGUNDOS)
+
+        return self._filtrar_e_logar(candidatos_totais)
+
+    def _extrair_cards_html(self, html: str) -> list[dict]:
+        soup = BeautifulSoup(html, "html.parser")
+        candidatos = []
+        vistos = set()
+
+        for link in soup.find_all("a", href=True):
+            href = link.get("href", "")
+            if not href or not self._REGEX_LINK_ANUNCIO.search(href) or href in vistos:
+                continue
+            vistos.add(href)
+
+            card = self._localizar_container_do_card(link)
+            texto_card = card.get_text(" ", strip=True)
+
+            url = href if href.startswith("http") else f"https://www.chavesnamao.com.br{href}"
+            match_id = re.search(r"-(\d+)/?$", href.rstrip("/"))
+            id_origem = (
+                f"chaves_na_mao-{match_id.group(1)}" if match_id
+                else f"chaves_na_mao-{hashlib.sha1(href.encode('utf-8')).hexdigest()[:16]}"
+            )
+
+            item = self._card_generico_para_item(
+                href, texto_card, url, id_origem, exigir_data_relativa=False
+            )
+            if item is None:
+                continue
+
+            item_finalizado = self._finalizar_item(item)
+            if item_finalizado is not None:
+                candidatos.append(item_finalizado)
+
+        return candidatos
