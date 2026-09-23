@@ -114,6 +114,21 @@ class DuckDuckGoScraper:
             )
             if preco_match else None
         )
+        if preco is None:
+            # Diagnóstico: execuções reais mostraram total_extraido=10 mas
+            # quase todos os itens reprovados por preco=None (mesmo padrão
+            # de IDs repetido entre execuções, indício de que a busca
+            # retorna sempre os mesmos resultados estáticos). Sem ver o
+            # texto bruto não dá pra saber se é: página agregadora sem
+            # preço isolado no snippet, formatação de preço diferente
+            # (ex.: sem "R$", "a partir de"), ou outro motivo — registrar
+            # a amostra aqui, em vez de arriscar um ajuste de regex às
+            # cegas.
+            logger.info(
+                "preco_nao_encontrado portal=%s id_origem=%s url=%s "
+                "amostra_texto=%r",
+                self.portal, id_origem, url, texto_completo[:300],
+            )
 
         area_match = re.search(r"(\d+)\s*m²", texto_completo)
         area_m2 = BaseScraper._to_float_or_none(area_match.group(1)) if area_match else 0.0
