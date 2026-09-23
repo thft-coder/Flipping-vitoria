@@ -8,12 +8,23 @@ from database import ja_processado, salvar_imovel
 from engine import avaliar_oportunidade
 from notifier import enviar_alerta_telegram
 from scrapers.busca_duckduckgo import DuckDuckGoScraper
-from scrapers.portais import OLXScraper, ZapVivaRealScraper
+from scrapers.portais import (
+    ChavesNaMaoScraper,
+    ImovelWebScraper,
+    OLXScraper,
+    ZapVivaRealScraper,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-SCRAPERS = [OLXScraper(), ZapVivaRealScraper(), DuckDuckGoScraper()]
+SCRAPERS = [
+    OLXScraper(),
+    ZapVivaRealScraper(),
+    ImovelWebScraper(),
+    ChavesNaMaoScraper(),
+    DuckDuckGoScraper(),
+]
 
 
 def processar_anuncio(anuncio: dict) -> bool:
